@@ -1,0 +1,27 @@
+# ============================================================
+# namespace.yaml
+#
+# Dedicated namespace for all production resources.
+# Isolates our workloads from system namespaces and other apps.
+#
+# Labels used for:
+#   - Vault injection: vault-injection=enabled enables Vault Agent Injector
+#   - Network policies: environment=production for ingress rules
+#   - Cost allocation: team/project labels for GCP billing reports
+# ============================================================
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: production
+  labels:
+    name: production
+    environment: production
+    team: devops
+    project: enterprise-app
+
+    # Enable Vault Agent Injector for all pods in this namespace
+    # The MutatingWebhookConfiguration filters on this label
+    vault-injection: enabled
+  annotations:
+    # GKE resource quota annotations
+    scheduler.alpha.kubernetes.io/defaultTolerations: "[]"

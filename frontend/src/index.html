@@ -1,0 +1,97 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Enterprise App — GKE Production</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+      background: #0f172a; color: #e2e8f0; min-height: 100vh;
+      display: flex; flex-direction: column; align-items: center;
+      justify-content: center; padding: 2rem;
+    }
+    .card {
+      background: #1e293b; border: 1px solid #334155;
+      border-radius: 12px; padding: 2.5rem; max-width: 600px;
+      width: 100%; box-shadow: 0 4px 32px rgba(0,0,0,0.4);
+    }
+    h1 { font-size: 1.8rem; margin-bottom: 0.5rem; color: #38bdf8; }
+    .badge {
+      display: inline-block; background: #0284c7; color: #fff;
+      padding: 2px 10px; border-radius: 99px; font-size: 0.75rem;
+      margin-bottom: 1.5rem;
+    }
+    .status { display: flex; gap: 1rem; flex-wrap: wrap; margin: 1.5rem 0; }
+    .status-item {
+      background: #0f172a; border: 1px solid #1e40af;
+      border-radius: 8px; padding: 0.75rem 1rem; flex: 1; min-width: 130px;
+    }
+    .status-item .label { font-size: 0.7rem; color: #94a3b8; text-transform: uppercase; }
+    .status-item .value { font-size: 1rem; color: #4ade80; margin-top: 4px; }
+    button {
+      background: #0284c7; color: #fff; border: none; border-radius: 8px;
+      padding: 0.75rem 1.5rem; font-size: 1rem; cursor: pointer;
+      margin-top: 1rem; width: 100%; transition: background 0.2s;
+    }
+    button:hover { background: #0369a1; }
+    #response {
+      margin-top: 1rem; padding: 1rem; background: #0f172a;
+      border-radius: 8px; font-size: 0.85rem; color: #94a3b8;
+      min-height: 60px; word-break: break-all;
+    }
+    .error { color: #f87171 !important; }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <h1>🚀 Enterprise App</h1>
+    <span class="badge">GKE Production</span>
+
+    <div class="status">
+      <div class="status-item">
+        <div class="label">Frontend</div>
+        <div class="value" id="fe-status">● Online</div>
+      </div>
+      <div class="status-item">
+        <div class="label">Backend</div>
+        <div class="value" id="be-status">● Checking…</div>
+      </div>
+      <div class="status-item">
+        <div class="label">Database</div>
+        <div class="value" id="db-status">● Checking…</div>
+      </div>
+    </div>
+
+    <button onclick="checkHealth()">Check Backend Health Only</button>
+    <div id="response">Click the button to ping the backend API.</div>
+  </div>
+
+  <script>
+    async function checkHealth() {
+      const el = document.getElementById('response');
+      const beEl = document.getElementById('be-status');
+      const dbEl = document.getElementById('db-status');
+      el.className = '';
+      el.textContent = 'Pinging /api/health …';
+      try {
+        const res = await fetch('/api/health');
+        const data = await res.json();
+        el.textContent = JSON.stringify(data, null, 2);
+        beEl.textContent = '● Online';
+        beEl.style.color = '#4ade80';
+        dbEl.textContent = data.database === 'connected' ? '● Connected' : '● Disconnected';
+        dbEl.style.color = data.database === 'connected' ? '#4ade80' : '#f87171';
+      } catch (err) {
+        el.className = 'error';
+        el.textContent = 'Error: ' + err.message;
+        beEl.textContent = '● Offline';
+        beEl.style.color = '#f87171';
+      }
+    }
+    // Auto-check on load
+    window.addEventListener('load', checkHealth);
+  </script>
+</body>
+</html>

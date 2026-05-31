@@ -1,0 +1,35 @@
+# ============================================================
+# mysql-pvc.yaml
+#
+# PersistentVolumeClaim for MySQL data storage.
+#
+# Architecture decisions:
+#   - storageClassName: standard-rwo
+#       GKE's "ReadWriteOnce" SSD class. Required for StatefulSet.
+#       "standard" is the HDD class (slower); "premium-rwo" is NVMe.
+#   - ReadWriteOnce: Only ONE pod mounts this volume at a time.
+#       Correct for MySQL (single-writer). Use ReadWriteMany only for NFS.
+#   - 20Gi: Adjust based on expected data volume.
+#       GKE allows online PVC expansion (no downtime).
+#   - Retain policy: The StorageClass determines what happens on PVC delete.
+#       "standard-rwo" defaults to Delete (disk is destroyed with PVC).
+#       For production data, consider a custom StorageClass with Retain policy.
+# ============================================================
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: mysql-pvc
+  namespace: production
+  labels:
+    app: mysql
+    tier: database
+  annotations:
+    # Document resize procedure: kubectl patch pvc mysql-pvc -p '{"spec":{"resources":{"requests":{"storage":"40Gi"}}}}'
+    resize-notes: "Online resize supported — patch spec.resources.requests.storage"
+spec:
+  accessModes:
+    - ReadWriteOnce          # Single-node mount (correct for MySQL)
+  storageClassName: standard-rwo   # GKE SSD persistent disk
+  resources:
+    requests:
+      storage: 20Gi          # Initial size — can be expanded online

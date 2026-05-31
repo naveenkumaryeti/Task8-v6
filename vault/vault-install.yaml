@@ -1,0 +1,104 @@
+# ============================================================
+# vault-install.yaml
+#
+# Helm values file for installing HashiCorp Vault on GKE.
+#
+# Install command:
+#   helm repo add hashicorp https://helm.releases.hashicorp.com
+#   helm repo update
+#   helm install vault hashicorp/vault \
+#     -f vault/vault-install.yaml \
+#     --namespace vault \
+#     --create-namespace
+#
+# Architecture:
+#   - Standalone mode (single Vault pod) for simplicity
+#   - For HA production: set server.ha.enabled=true with 3+ replicas
+#     and use GCS backend for storage
+# ============================================================
+global:
+  enabled: true
+  tlsDisable: true        # Keep TLS enabled in production
+
+injector:
+  # The Vault Agent Injector watches for vault.hashicorp.com/* annotations
+  # on pods and automatically injects an init container + sidecar that
+  # fetches secrets from Vault and writes them to /vault/secrets/
+  enabled: true
+  replicas: 2              # 2 replicas for injector HA
+  logLevel: info
+
+  resources:
+    requests:
+      memory: "64Mi"
+      cpu: "50m"
+    limits:
+      memory: "128Mi"
+      cpu: "250m"
+
+  webhook:
+    # Fail open so Vault downtime doesn't block pod creation
+    # Change to Fail for strict security (pods won't start without Vault)
+    failurePolicy: Ignore
+
+server:
+  serviceAccount:
+    annotations:
+      iam.gke.io/gcp-service-account: "vault-server@gcp-b2-devops-naveen.iam.gserviceaccount.com"
+  # ── High Availability (Standalone for now, enable for production HA) ──────
+  ha:
+    enabled: false         # Set true for 3+ node HA cluster
+
+  standalone:
+    enabled: true
+    config: |
+      ui = true
+
+      listener "tcp" {
+        tls_disable = 1
+        address     = "[::]:8200"
+      }
+
+      # File storage backend (use GCS for production HA)
+      storage "file" {
+        path = "/vault/data"
+      }
+
+      # Seal configuration — auto-unseal using GCP KMS
+      # Replace with your actual KMS details
+      seal "gcpckms" {
+        project     = "gcp-b2-devops-naveen"
+        region      = "asia-south1"
+        key_ring    = "vault-keyring"
+        crypto_key  = "vault-unseal-key"
+      }
+
+  # Persistent storage for Vault data
+  dataStorage:
+    enabled: true
+    size: 10Gi
+    storageClass: standard-rwo
+    accessMode: ReadWriteOnce
+
+  resources:
+    requests:
+      memory: "256Mi"
+      cpu: "250m"
+    limits:
+      memory: "512Mi"
+      cpu: "500m"
+
+  # Readiness probe configuration
+  readinessProbe:
+    enabled: true
+    path: "/v1/sys/health?standbyok=true"
+
+  livenessProbe:
+    enabled: true
+    path: "/v1/sys/health?standbyok=true"
+    initialDelaySeconds: 60
+
+ui:
+  enabled: true
+  serviceType: ClusterIP   # Access via kubectl port-forward in production
+  # For external access: serviceType: LoadBalancer (not recommended for prod)

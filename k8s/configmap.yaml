@@ -1,0 +1,57 @@
+# ============================================================
+# k8s/configmap.yaml  —  ENHANCED for enterprise-app.duckdns.org
+#
+# CHANGES FROM ORIGINAL:
+#   ✅  ALLOWED_ORIGINS updated from yourdomain.com  →  enterprise-app.duckdns.org
+#   ✅  APP_DOMAIN added as a new key (used by backend for redirect URLs)
+#   ✅  CORS_CREDENTIALS added to control Access-Control-Allow-Credentials
+#
+# RULE: Secrets (DB_PASSWORD, JWT_SECRET) live in Vault — never here.
+#       This file is safe to commit to git.
+#
+# HOW TO APPLY:
+#   kubectl apply -f k8s/configmap.yaml -n production
+#   # Restart backend to pick up updated ALLOWED_ORIGINS:
+#   kubectl rollout restart deployment/backend -n production
+# ============================================================
+
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: app-config
+  namespace: production
+  labels:
+    app: enterprise-app
+    managed-by: kubectl
+data:
+  # ── Application Runtime ──────────────────────────────────────────────────
+  NODE_ENV:       "production"
+  PORT:           "3000"
+  LOG_LEVEL:      "info"
+  APP_VERSION:    "1.0.0"
+
+  # ── Public domain — used by backend for CORS + redirect URL construction ─
+  # Keep this in sync with the host in k8s/ingress.yaml.
+  APP_DOMAIN:     "enterprise-app.duckdns.org"
+
+  # ── Database connection (host/port only — credentials injected by Vault) ─
+  DB_HOST:        "mysql-service"
+  DB_PORT:        "3306"
+  DB_NAME:        "appdb"
+
+  # ── CORS ──────────────────────────────────────────────────────────────────
+  # Updated from yourdomain.com → enterprise-app.duckdns.org
+  # CORS_CREDENTIALS: allow cookies/auth headers in cross-origin requests.
+  # Set "false" if the frontend and backend are on the same origin (they are
+  # here — same host, Nginx proxies /api/*) — kept "true" for flexibility.
+  ALLOWED_ORIGINS:    "https://enterprise-app.duckdns.org"
+  CORS_CREDENTIALS:   "true"
+
+  # ── Rate limiting ─────────────────────────────────────────────────────────
+  ENABLE_RATE_LIMIT:  "true"
+  RATE_LIMIT_MAX:     "100"        # requests per window per IP
+  RATE_LIMIT_WINDOW:  "60000"      # window size in ms (60 seconds)
+
+  # ── Observability ─────────────────────────────────────────────────────────
+  METRICS_ENABLED:    "true"
+  TRACING_ENABLED:    "false"

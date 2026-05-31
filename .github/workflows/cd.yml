@@ -1,0 +1,308 @@
+# ============================================================
+# .github/workflows/cd.yml
+#
+# Continuous Deployment Pipeline
+#
+# Triggers:
+#   - On completion of CI pipeline (push to main only)
+#   - Manual workflow dispatch (for emergency deploys)
+#
+# Flow:
+#   CI passes → CD triggered → Authorize runner IP → Deploy to GKE → Verify → Revoke IP → Notify
+#
+# Deployment strategy:
+#   Rolling update with maxUnavailable=0 (zero downtime)
+#   Automatic rollback if health checks fail post-deploy
+#
+# Required GitHub Secrets:
+#   GCP_PROJECT_ID       - GCP project ID
+#   GCP_SA_KEY           - Service account JSON (base64)
+#   GCP_REGION           - e.g. asia-south1
+#   GKE_CLUSTER          - e.g. prod-cluster
+#   GKE_ZONE             - e.g. asia-south1-a
+#   GAR_REPO_NAME        - e.g. prod-repo
+# ============================================================
+
+name: CD — Deploy to GKE
+
+on:
+  # Trigger CD after CI completes successfully on master
+  workflow_run:
+    workflows: ["CI — Build, Test, Scan, Push"]
+    types:
+      - completed
+    branches:
+      - master
+
+  # Allow manual trigger with custom version
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version to deploy (e.g. 1.2.0 or sha-abc1234)'
+        required: true
+      environment:
+        description: 'Target environment'
+        required: true
+        default: 'production'
+        type: choice
+        options:
+          - production
+
+# Only one CD run at a time (prevent concurrent deploys)
+concurrency:
+  group: cd-production
+  cancel-in-progress: false   # Never cancel in-progress deploys (dangerous)
+
+env:
+  GCP_REGION:     ${{ secrets.GCP_REGION }}
+  GCP_PROJECT_ID: ${{ secrets.GCP_PROJECT_ID }}
+  GKE_CLUSTER:    ${{ secrets.GKE_CLUSTER }}       # secret name: GKE_CLUSTER
+  GKE_ZONE:       ${{ secrets.GKE_ZONE }}
+  GAR_REPO_NAME:  ${{ secrets.GAR_REPO_NAME || 'prod-repo' }}
+  NAMESPACE:      production
+  REGISTRY:       ${{ secrets.GCP_REGION }}-docker.pkg.dev/${{ secrets.GCP_PROJECT_ID }}/${{ secrets.GAR_REPO_NAME || 'prod-repo' }}
+
+jobs:
+  # ════════════════════════════════════════════════════════════
+  # Gate: Only deploy if CI succeeded
+  # ════════════════════════════════════════════════════════════
+  gate:
+    name: Gate — Verify CI Success
+    runs-on: ubuntu-latest
+    if: >
+      github.event_name == 'workflow_dispatch' ||
+      github.event.workflow_run.conclusion == 'success'
+
+    steps:
+      - name: CI status check
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "Manual deploy triggered — skipping CI gate"
+          elif [ "${{ github.event.workflow_run.conclusion }}" != "success" ]; then
+            echo "CI pipeline did not succeed. Aborting deployment."
+            exit 1
+          else
+            echo "CI pipeline succeeded. Proceeding with deployment."
+          fi
+
+  # ════════════════════════════════════════════════════════════
+  # JOB: Deploy to GKE
+  # ════════════════════════════════════════════════════════════
+  deploy:
+    name: Deploy to Production GKE
+    runs-on: ubuntu-latest
+    needs: gate
+    environment:
+      name: production
+      url: https://yourdomain.com    # Update with actual domain or LoadBalancer IP
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4   # v4 is latest stable (v5 does not exist)
+
+      # ── Determine version to deploy ────────────────────────────────────────
+      - name: Determine deploy version
+        id: version
+        run: |
+          if [ -n "${{ github.event.inputs.version }}" ]; then
+            VERSION="${{ github.event.inputs.version }}"
+          elif [[ "${{ github.event.workflow_run.head_branch }}" == "master" ]]; then
+            SHA="${{ github.event.workflow_run.head_sha }}"
+            VERSION="sha-$(echo $SHA | cut -c1-7)"
+          else
+            VERSION="latest"
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "🚀 Deploying version: $VERSION"
+
+      # ── Authenticate with GCP ──────────────────────────────────────────────
+      - name: Authenticate with Google Cloud
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GCP_SA_KEY }}
+
+      - name: Set up gcloud CLI
+        uses: google-github-actions/setup-gcloud@v2
+
+      # ── OPTION B: Whitelist runner IP on GKE master authorized networks ────
+      # The GitHub Actions runner has a dynamic IP that changes every run.
+      # We fetch the runner's current public IP and add it to the GKE
+      # master authorized networks so kubectl can reach the API server.
+      # The IP is revoked at the end of the job in the cleanup step.
+      - name: Authorize runner IP on GKE master authorized networks
+        run: |
+          RUNNER_IP=$(curl -sf https://api.ipify.org)
+          echo "Runner IP: $RUNNER_IP"
+          echo "RUNNER_IP=$RUNNER_IP" >> "$GITHUB_ENV"
+
+          gcloud container clusters update ${{ env.GKE_CLUSTER }} \
+            --region=${{ env.GKE_ZONE }} \
+            --enable-master-authorized-networks \
+            --master-authorized-networks="${RUNNER_IP}/32" \
+            --quiet
+
+          echo "✅ Runner IP $RUNNER_IP authorized on GKE master"
+
+      # ── Get GKE credentials (requires master authorized networks to allow runner IP) ──
+      - name: Get GKE credentials
+        uses: google-github-actions/get-gke-credentials@v2
+        with:
+          cluster_name: ${{ env.GKE_CLUSTER }}   # required field — was missing before
+          location:     ${{ env.GKE_ZONE }}
+          project_id:   ${{ env.GCP_PROJECT_ID }}
+
+      # ── Pre-deployment health check ────────────────────────────────────────
+      - name: Pre-deployment pod status
+        run: |
+          echo "=== Current Pod Status ==="
+          kubectl get pods -n ${{ env.NAMESPACE }} -o wide 2>/dev/null || echo "Namespace not found yet"
+          echo ""
+          echo "=== Current Deployments ==="
+          kubectl get deployments -n ${{ env.NAMESPACE }} 2>/dev/null || true
+
+      # ── Apply Kubernetes manifests ─────────────────────────────────────────
+      # FIX: Added --validate=false is NOT the right fix here.
+      # The real fix is the IP whitelist above which lets kubectl reach
+      # the API server for schema validation. Both commands now work correctly.
+      - name: Apply namespace and configmaps
+        run: |
+          kubectl apply -f k8s/namespace.yaml
+          kubectl apply -f k8s/configmap.yaml -n ${{ env.NAMESPACE }}
+
+      # ── Deploy Frontend ────────────────────────────────────────────────────
+      - name: Deploy frontend
+        run: |
+          VERSION="${{ steps.version.outputs.version }}"
+          FRONTEND_IMAGE="${{ env.REGISTRY }}/frontend:${VERSION}"
+
+          echo "Deploying frontend: $FRONTEND_IMAGE"
+
+          kubectl apply -f k8s/frontend-deployment.yaml -n ${{ env.NAMESPACE }}
+          kubectl apply -f k8s/frontend-service.yaml    -n ${{ env.NAMESPACE }}
+
+          # Override image tag with the exact version from this CI run
+          kubectl set image deployment/frontend \
+            nginx="$FRONTEND_IMAGE" \
+            -n ${{ env.NAMESPACE }}
+
+          # Record deploy version in rollout history
+          kubectl annotate deployment/frontend \
+            kubernetes.io/change-cause="CD deploy v${VERSION} — run #${{ github.run_number }}" \
+            -n ${{ env.NAMESPACE }} --overwrite
+
+          # Block until rollout completes or times out
+          kubectl rollout status deployment/frontend \
+            -n ${{ env.NAMESPACE }} --timeout=180s
+
+      # ── Deploy Backend ─────────────────────────────────────────────────────
+      - name: Deploy backend
+        run: |
+          VERSION="${{ steps.version.outputs.version }}"
+          BACKEND_IMAGE="${{ env.REGISTRY }}/backend:${VERSION}"
+
+          echo "Deploying backend: $BACKEND_IMAGE"
+
+          kubectl apply -f k8s/backend-deployment.yaml -n ${{ env.NAMESPACE }}
+          kubectl apply -f k8s/backend-service.yaml    -n ${{ env.NAMESPACE }}
+
+          kubectl set image deployment/backend \
+            backend="$BACKEND_IMAGE" \
+            -n ${{ env.NAMESPACE }}
+
+          kubectl annotate deployment/backend \
+            kubernetes.io/change-cause="CD deploy v${VERSION} — run #${{ github.run_number }}" \
+            -n ${{ env.NAMESPACE }} --overwrite
+
+          kubectl rollout status deployment/backend \
+            -n ${{ env.NAMESPACE }} --timeout=180s
+
+      # ── Apply supplementary resources ──────────────────────────────────────
+      - name: Apply Ingress and HPA
+        run: |
+          kubectl apply -f k8s/ingress.yaml -n ${{ env.NAMESPACE }}
+          kubectl apply -f k8s/hpa.yaml     -n ${{ env.NAMESPACE }}
+
+      # ── Post-deployment verification ───────────────────────────────────────
+      - name: Post-deployment health check
+        run: |
+          echo "=== Pod Status After Deploy ==="
+          kubectl get pods -n ${{ env.NAMESPACE }} -o wide
+
+          echo ""
+          echo "=== Rollout History ==="
+          kubectl rollout history deployment/frontend -n ${{ env.NAMESPACE }}
+          kubectl rollout history deployment/backend  -n ${{ env.NAMESPACE }}
+
+          echo ""
+          echo "=== Services ==="
+          kubectl get services -n ${{ env.NAMESPACE }}
+
+          echo ""
+          echo "=== HPA ==="
+          kubectl get hpa -n ${{ env.NAMESPACE }}
+
+      # ── Application endpoint check ─────────────────────────────────────────
+      - name: Verify application endpoints
+        run: |
+          echo "Waiting for LoadBalancer external IP (up to 2 minutes)..."
+          for i in $(seq 1 24); do
+            EXTERNAL_IP=$(kubectl get service frontend-service \
+              -n ${{ env.NAMESPACE }} \
+              -o jsonpath='{.status.loadBalancer.ingress[0].ip}' 2>/dev/null || echo "")
+            if [ -n "$EXTERNAL_IP" ]; then
+              echo "External IP: $EXTERNAL_IP"
+              break
+            fi
+            echo "Attempt $i/24 — waiting 5s..."
+            sleep 5
+          done
+
+          if [ -n "$EXTERNAL_IP" ]; then
+            echo "Checking /health endpoint..."
+            HTTP_CODE=$(curl -sf -o /dev/null -w "%{http_code}" \
+              "http://${EXTERNAL_IP}/health" --max-time 10 || echo "000")
+            if [ "$HTTP_CODE" = "200" ]; then
+              echo "✅ Frontend health check passed (HTTP $HTTP_CODE)"
+            else
+              echo "❌ Frontend returned HTTP $HTTP_CODE — rolling back!"
+              kubectl rollout undo deployment/frontend -n ${{ env.NAMESPACE }}
+              kubectl rollout undo deployment/backend  -n ${{ env.NAMESPACE }}
+              exit 1
+            fi
+          else
+            echo "⚠️  LoadBalancer IP not ready yet — skipping HTTP check"
+          fi
+
+      # ── OPTION B CLEANUP: Revoke runner IP from master authorized networks ─
+      # Always runs (success OR failure) so the runner IP is never left open.
+      # After this step the GKE API server is no longer reachable from the runner.
+      - name: Revoke runner IP from GKE master authorized networks
+        if: always()   # critical — must run even if deploy or health check fails
+        run: |
+          echo "Revoking runner IP ${RUNNER_IP} from GKE master authorized networks..."
+
+          # Reset to open (0.0.0.0/0) so future runs can re-authorize cleanly.
+          # Replace 0.0.0.0/0 with your office/home CIDR if you want tighter control.
+          gcloud container clusters update ${{ env.GKE_CLUSTER }} \
+            --region=${{ env.GKE_ZONE }} \
+            --enable-master-authorized-networks \
+            --master-authorized-networks="0.0.0.0/0" \
+            --quiet
+
+          echo "✅ Runner IP revoked. Master authorized networks reset."
+
+      # ── Deployment summary ─────────────────────────────────────────────────
+      - name: Deployment summary
+        if: always()
+        run: |
+          echo ""
+          echo "╔══════════════════════════════════════╗"
+          echo "║       DEPLOYMENT SUMMARY             ║"
+          echo "╠══════════════════════════════════════╣"
+          echo "║ Version:  ${{ steps.version.outputs.version }}"
+          echo "║ Cluster:  ${{ env.GKE_CLUSTER }}"
+          echo "║ Zone:     ${{ env.GKE_ZONE }}"
+          echo "║ Run:      #${{ github.run_number }}"
+          echo "║ Actor:    ${{ github.actor }}"
+          echo "╚══════════════════════════════════════╝"

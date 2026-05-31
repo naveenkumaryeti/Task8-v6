@@ -1,0 +1,113 @@
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: mysql
+  namespace: production
+  labels:
+    app: mysql
+spec:
+  serviceName: mysql-service
+  replicas: 1
+  selector:
+    matchLabels:
+      app: mysql
+  template:
+    metadata:
+      labels:
+        app: mysql
+      annotations:
+        # ── Vault Agent Injector annotations ──────────────────────────────────
+        vault.hashicorp.com/agent-inject: "true"
+        vault.hashicorp.com/role: "mysql-role"
+
+        # CRITICAL: explicit in-cluster Vault service address.
+        # Overrides injector default — agent connects here from inside pod.
+        vault.hashicorp.com/service: "http://vault.vault.svc.cluster.local:8200"
+
+        # Read the KV-v2 API path and write to /vault/secrets/db-root
+        vault.hashicorp.com/agent-inject-secret-db-root: "secret/data/mysql"
+
+        # Render as shell-sourceable env vars
+        vault.hashicorp.com/agent-inject-template-db-root: |
+          {{- with secret "secret/data/mysql" -}}
+          export MYSQL_ROOT_PASSWORD="{{ .Data.data.root_password }}"
+          export MYSQL_PASSWORD="{{ .Data.data.app_password }}"
+          export MYSQL_USER="{{ .Data.data.app_user }}"
+          export MYSQL_DATABASE="{{ .Data.data.database }}"
+          {{- end }}
+
+        # Log level — set to debug if init container still gets stuck
+        vault.hashicorp.com/log-level: "info"
+
+        # Init-only: agent exits after writing secrets (no sidecar running)
+        vault.hashicorp.com/agent-pre-populate-only: "true"
+    spec:
+      serviceAccountName: vault-auth-sa
+      initContainers: []
+      containers:
+        - name: mysql
+          image: mysql:8.0
+          command:
+            - /bin/bash
+            - -c
+            - |
+              # Source Vault-injected credentials before starting MySQL
+              if [ -f /vault/secrets/db-root ]; then
+                source /vault/secrets/db-root
+              else
+                echo "ERROR: /vault/secrets/db-root not found" >&2
+                exit 1
+              fi
+              exec docker-entrypoint.sh mysqld
+          ports:
+            - containerPort: 3306
+              name: mysql
+          env:
+            # These are overridden by sourcing /vault/secrets/db-root above.
+            # Set here as non-empty placeholders so MySQL entrypoint doesn't
+            # complain about missing required variables before source runs.
+            - name: MYSQL_ROOT_PASSWORD
+              value: "placeholder-overridden-by-vault"
+          volumeMounts:
+            - name: mysql-data
+              mountPath: /var/lib/mysql
+            - name: mysql-config
+              mountPath: /etc/mysql/conf.d
+          resources:
+            requests:
+              memory: "256Mi"
+              cpu: "250m"
+            limits:
+              memory: "512Mi"
+              cpu: "500m"
+          readinessProbe:
+            exec:
+              command:
+                - /bin/bash
+                - -c
+                - "mysqladmin ping -h localhost -u root -p${MYSQL_ROOT_PASSWORD} 2>/dev/null"
+            initialDelaySeconds: 30
+            periodSeconds: 10
+            failureThreshold: 6
+          livenessProbe:
+            exec:
+              command:
+                - /bin/bash
+                - -c
+                - "mysqladmin ping -h localhost -u root -p${MYSQL_ROOT_PASSWORD} 2>/dev/null"
+            initialDelaySeconds: 60
+            periodSeconds: 15
+            failureThreshold: 4
+      volumes:
+        - name: mysql-config
+          configMap:
+            name: mysql-config
+  volumeClaimTemplates:
+    - metadata:
+        name: mysql-data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        storageClassName: standard-rwo
+        resources:
+          requests:
+            storage: 10Gi

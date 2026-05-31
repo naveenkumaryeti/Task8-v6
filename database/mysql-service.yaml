@@ -1,0 +1,24 @@
+# ============================================================
+# mysql-service.yaml
+#
+# ClusterIP service — MySQL is INTERNAL ONLY.
+# No external access. Backend connects via DNS: mysql-service:3306
+# ============================================================
+apiVersion: v1
+kind: Service
+metadata:
+  name: mysql-service
+  namespace: production
+  labels:
+    app: mysql
+    tier: database
+spec:
+  type: ClusterIP        # Internal only — never expose DB externally
+  selector:
+    app: mysql
+  ports:
+    - name: mysql
+      port: 3306
+      targetPort: 3306
+      protocol: TCP
+  # sessionAffinity: None — stateless connection pooling handled by app

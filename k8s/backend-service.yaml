@@ -1,0 +1,25 @@
+# ============================================================
+# backend-service.yaml
+#
+# ClusterIP service — backend is INTERNAL ONLY.
+# Frontend Nginx proxies /api/* to backend-service:3000.
+# External access goes through Ingress → Frontend → Backend.
+# Direct external exposure of the backend API is NOT allowed.
+# ============================================================
+apiVersion: v1
+kind: Service
+metadata:
+  name: backend-service
+  namespace: production
+  labels:
+    app: backend
+    tier: backend
+spec:
+  type: ClusterIP          # Internal only
+  selector:
+    app: backend           # Routes to backend pods
+  ports:
+    - name: http
+      port: 3000
+      targetPort: http     # Named port from deployment
+      protocol: TCP

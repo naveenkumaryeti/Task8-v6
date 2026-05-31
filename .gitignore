@@ -1,0 +1,94 @@
+# ============================================================
+# .gitignore
+#
+# CRITICAL: Never commit secrets, credentials, or sensitive data.
+# Vault manages all secrets — nothing sensitive belongs in git.
+# ============================================================
+
+# ── Node.js ───────────────────────────────────────────────────────────────────
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+.npm
+.yarn-integrity
+*.log
+
+# ── Build outputs ─────────────────────────────────────────────────────────────
+dist/
+build/
+.next/
+out/
+coverage/
+*.tsbuildinfo
+
+# ── Environment files — NEVER COMMIT THESE ────────────────────────────────────
+.env
+.env.*
+!.env.example         # .env.example (with placeholder values) IS safe to commit
+*.env
+.env.local
+.env.production
+.env.development
+
+# ── Secrets & Credentials — NEVER COMMIT THESE ───────────────────────────────
+*.json.key
+service-account*.json
+*-sa-key.json
+gcp-key.json
+vault-init-keys.json  # Vault init output (root token + unseal keys)
+*.pem
+*.key
+*.cert
+*.p12
+*.pfx
+kubeconfig
+.kube/
+*.kubeconfig
+
+# ── Docker ────────────────────────────────────────────────────────────────────
+.dockerignore         # Can be committed — not a secret
+docker-compose.override.yml   # Local overrides — may contain dev secrets
+
+# ── IDE & OS ──────────────────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.project
+.classpath
+
+# ── Temporary files ───────────────────────────────────────────────────────────
+tmp/
+temp/
+*.tmp
+*.bak
+*.backup
+
+# ── Kubernetes generated files ────────────────────────────────────────────────
+# Do NOT ignore k8s/*.yaml — manifests should be committed
+# Only ignore generated/sensitive k8s output
+*.kubeconfig
+kustomization-generated.yaml
+
+# ── Terraform (if used) ───────────────────────────────────────────────────────
+.terraform/
+*.tfstate
+*.tfstate.backup
+*.tfvars           # May contain secrets — use only .tfvars.example
+.terraform.lock.hcl
+
+# ── Test artifacts ────────────────────────────────────────────────────────────
+coverage/
+.nyc_output/
+junit.xml
+test-results/
+
+# ── Vault ─────────────────────────────────────────────────────────────────────
+vault/data/          # Vault data directory (local dev)
+vault-init*.txt
+vault-init*.json
+unseal-keys*.txt

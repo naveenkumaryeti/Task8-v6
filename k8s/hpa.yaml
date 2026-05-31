@@ -1,0 +1,146 @@
+# ============================================================
+# hpa.yaml
+#
+# Horizontal Pod Autoscaler + PodDisruptionBudgets
+#
+# HPA behavior:
+#   - Monitors CPU/Memory of pods
+#   - Scales OUT when avg CPU > 70% (add pods)
+#   - Scales IN  when avg CPU < 70% (remove pods, slowly)
+#   - Scale-in has a 5-minute stabilization window to prevent flapping
+#
+# Requirements:
+#   metrics-server must be installed in the cluster:
+#   kubectl apply -f https://github.com/kubernetes-sigs/metrics-server/releases/latest/download/components.yaml
+# ============================================================
+
+# ── Backend HPA ───────────────────────────────────────────────────────────────
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: backend-hpa
+  namespace: production
+  labels:
+    app: backend
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: backend
+
+  minReplicas: 3      # Never go below 3 (HA requirement)
+  maxReplicas: 10     # Cost cap — adjust based on budget/traffic
+
+  metrics:
+    # ── CPU-based scaling ─────────────────────────────────────────────────
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 70    # Scale out when avg CPU > 70%
+
+    # ── Memory-based scaling ──────────────────────────────────────────────
+    # Useful for Node.js which can have high memory under load
+    - type: Resource
+      resource:
+        name: memory
+        target:
+          type: Utilization
+          averageUtilization: 80    # Scale out when avg memory > 80%
+
+  behavior:
+    # ── Scale Out Policy ────────────────────────────────────────────────────
+    # Scale out aggressively (respond to traffic spikes quickly)
+    scaleUp:
+      stabilizationWindowSeconds: 60    # 1 min window to confirm spike is real
+      policies:
+        - type: Pods
+          value: 2            # Add up to 2 pods per scaling event
+          periodSeconds: 60
+      selectPolicy: Max       # Use the policy that adds the most pods
+
+    # ── Scale In Policy ─────────────────────────────────────────────────────
+    # Scale in conservatively (avoid removing pods during a brief lull)
+    scaleDown:
+      stabilizationWindowSeconds: 300   # 5 min before removing pods
+      policies:
+        - type: Pods
+          value: 1            # Remove 1 pod at a time
+          periodSeconds: 120  # Only scale down every 2 minutes
+      selectPolicy: Min       # Use the policy that removes the fewest pods
+
+---
+# ── Frontend HPA ──────────────────────────────────────────────────────────────
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: frontend-hpa
+  namespace: production
+  labels:
+    app: frontend
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: frontend
+
+  minReplicas: 2
+  maxReplicas: 6
+
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 75
+
+  behavior:
+    scaleUp:
+      stabilizationWindowSeconds: 60
+      policies:
+        - type: Pods
+          value: 2
+          periodSeconds: 60
+    scaleDown:
+      stabilizationWindowSeconds: 300
+      policies:
+        - type: Pods
+          value: 1
+          periodSeconds: 120
+
+---
+# ── Backend PodDisruptionBudget ────────────────────────────────────────────────
+# Ensures at least 2 backend pods are always running during:
+#   - Node upgrades (kubectl drain)
+#   - Voluntary evictions
+#   - Cluster autoscaler scale-down
+# This protects availability during maintenance windows.
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: backend-pdb
+  namespace: production
+  labels:
+    app: backend
+spec:
+  minAvailable: 2          # Always keep 2+ backend pods running
+  selector:
+    matchLabels:
+      app: backend
+
+---
+# ── Frontend PodDisruptionBudget ───────────────────────────────────────────────
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: frontend-pdb
+  namespace: production
+  labels:
+    app: frontend
+spec:
+  minAvailable: 1          # Always keep at least 1 frontend pod running
+  selector:
+    matchLabels:
+      app: frontend

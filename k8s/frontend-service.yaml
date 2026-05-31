@@ -1,0 +1,35 @@
+# ============================================================
+# frontend-service.yaml
+#
+# LoadBalancer service — exposes frontend to the internet.
+# GKE automatically provisions a GCP External Load Balancer.
+#
+# In production, prefer using an Ingress instead of LoadBalancer directly:
+#   - Ingress supports multiple services behind one IP
+#   - Ingress supports SSL termination centrally
+#   - LoadBalancer per service is expensive (one IP per service)
+#
+# This LoadBalancer is kept as a fallback. Primary access is via Ingress.
+# ============================================================
+apiVersion: v1
+kind: Service
+metadata:
+  name: frontend-service
+  namespace: production
+  labels:
+    app: frontend
+    tier: frontend
+  annotations:
+    # GKE Cloud Load Balancer annotations
+    cloud.google.com/neg: '{"ingress": true}'   # Enable network endpoint groups for Ingress
+    cloud.google.com/backend-config: '{"default": "frontend-backend-config"}'
+spec:
+  type: LoadBalancer
+  selector:
+    app: frontend           # Routes to pods with this label
+  ports:
+    - name: http
+      port: 80
+      targetPort: http       # Named port from deployment
+      protocol: TCP
+  # sessionAffinity: None — stateless, any replica can serve any request

@@ -1,0 +1,100 @@
+# ============================================================
+# cert-manager/cluster-issuer.yaml
+#
+# ClusterIssuer — tells cert-manager HOW to request TLS certificates
+# from Let's Encrypt for any namespace in the cluster.
+#
+# This is a NEW file not present in the original project.
+# It must be applied ONCE before the Ingress is applied.
+#
+# HOW TO APPLY:
+#   # 1. First install cert-manager itself:
+#   kubectl apply -f https://github.com/cert-manager/cert-manager/releases/download/v1.14.0/cert-manager.yaml
+#
+#   # 2. Wait for cert-manager pods to be ready:
+#   kubectl wait --namespace cert-manager \
+#     --for=condition=ready pod \
+#     --selector=app.kubernetes.io/instance=cert-manager \
+#     --timeout=90s
+#
+#   # 3. Apply this ClusterIssuer:
+#   kubectl apply -f cert-manager/cluster-issuer.yaml
+#
+#   # 4. Verify it is Ready=True:
+#   kubectl get clusterissuer letsencrypt-prod
+#
+# HOW CERT ISSUANCE WORKS (HTTP-01 challenge):
+#   1. cert-manager sees Ingress annotation: cert-manager.io/cluster-issuer: letsencrypt-prod
+#   2. Creates a Certificate resource in namespace "production"
+#   3. Creates a temporary Ingress rule to serve a challenge token at:
+#      http://enterprise-app.duckdns.org/.well-known/acme-challenge/<token>
+#   4. Let's Encrypt fetches that URL to verify domain ownership
+#   5. cert-manager stores the signed cert in Secret "app-tls-cert"
+#   6. NGINX Ingress Controller picks up the new Secret for TLS
+#   7. cert-manager auto-renews ~30 days before expiry (cert lasts 90 days)
+#
+# REQUIREMENT: DNS A Record for enterprise-app.duckdns.org must resolve to the
+#              cluster's external IP BEFORE this challenge will succeed.
+# ============================================================
+
+apiVersion: cert-manager.io/v1
+kind: ClusterIssuer
+metadata:
+  name: letsencrypt-prod
+  # ClusterIssuer is cluster-scoped — no namespace field
+  labels:
+    app: enterprise-app
+spec:
+  acme:
+    # Let's Encrypt production endpoint
+    # Rate limited: 50 certificates per registered domain per week.
+    # Use the staging endpoint below for testing to avoid hitting rate limits:
+    #   server: https://acme-staging-v02.api.letsencrypt.org/directory
+    server: https://acme-v02.api.letsencrypt.org/directory
+
+    # !! REPLACE THIS with your real email address !!
+    # Let's Encrypt sends expiry warnings to this address.
+    email: devops@enterprise-app.duckdns.org
+
+    # cert-manager stores the ACME account private key in this Secret.
+    # This is the key that identifies YOUR account with Let's Encrypt.
+    # Keep this Secret backed up — losing it means re-registering.
+    privateKeySecretRef:
+      name: letsencrypt-prod-account-key
+
+    # HTTP-01 challenge solver — proves domain ownership via HTTP
+    # Works because the NGINX Ingress Controller can temporarily serve
+    # the challenge token at /.well-known/acme-challenge/<token>
+    solvers:
+      - http01:
+          ingress:
+            # Must match kubernetes.io/ingress.class in ingress.yaml
+            class: nginx
+
+---
+# ============================================================
+# Staging ClusterIssuer — use this for testing to avoid rate limits
+#
+# Let's Encrypt staging issues UNTRUSTED certificates (browsers will
+# show a warning) but has much higher rate limits for testing.
+#
+# To use staging:
+#   1. Apply this resource
+#   2. Change ingress.yaml annotation to: cert-manager.io/cluster-issuer: "letsencrypt-staging"
+#   3. After confirming cert issuance works, switch back to letsencrypt-prod
+# ============================================================
+
+apiVersion: cert-manager.io/v1
+kind: ClusterIssuer
+metadata:
+  name: letsencrypt-staging
+spec:
+  acme:
+    server: https://acme-staging-v02.api.letsencrypt.org/directory
+    email: devops@enterprise-app.duckdns.org
+    privateKeySecretRef:
+      name: letsencrypt-staging-account-key
+    solvers:
+      - http01:
+          ingress:
+            class: nginx

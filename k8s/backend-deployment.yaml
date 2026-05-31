@@ -1,0 +1,221 @@
+# ============================================================
+# backend-deployment.yaml
+#
+# Node.js API backend — the most critical component.
+#
+# Key decisions:
+#   - 3 replicas minimum (production SLA — survives 2 node failures)
+#   - Vault Agent Injector injects DB credentials at pod startup
+#   - Liveness probe → /api/ping (NEVER checks DB — avoids cascade restarts)
+#   - Readiness probe → /api/health (validates DB connection before admitting traffic)
+#   - preStop hook + terminationGracePeriodSeconds → zero-downtime rolling updates
+#   - PodDisruptionBudget ensures minimum 2 pods during voluntary disruptions
+#
+# Fixes applied:
+#   [1] CRASH FIX: Removed manual vault-secrets volume and volumeMount.
+#       The Vault Agent Injector webhook automatically injects:
+#         - an init container to fetch secrets
+#         - the vault-secrets volume (emptyDir tmpfs)
+#         - the /vault/secrets volumeMount into every container
+#       Declaring them manually too causes:
+#         spec.volumes[4].name: Duplicate value: "vault-secrets"
+#         spec.containers[0].volumeMounts[2].mountPath: Invalid value: "/vault/secrets": must be unique
+#       Rule: never manually declare anything the Vault injector owns.
+#   [2] imagePullPolicy: IfNotPresent — correct for pinned immutable tags.
+#   [3] version label removed from pod template — causes ReplicaSet churn on every deploy.
+#   [4] topologySpreadConstraints added alongside podAntiAffinity for explicit zone+node spread.
+# ============================================================
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: backend
+  namespace: production
+  labels:
+    app: backend
+    tier: backend
+    version: "1.0.0"
+  annotations:
+    kubernetes.io/change-cause: "Initial deployment v1.0.0"
+
+spec:
+  replicas: 3
+
+  selector:
+    matchLabels:
+      app: backend
+
+  # ── Zero-Downtime Rolling Update Strategy ────────────────────────────────
+  # maxUnavailable: 0 → Always maintain 3 ready pods during rollout
+  # maxSurge: 1       → Temporarily run 4 pods during update
+  # Combined: new pod becomes ready BEFORE old pod is terminated
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 1
+
+  template:
+    metadata:
+      labels:
+        app: backend
+        tier: backend
+        # FIX [3]: version removed from pod template — mutating it on every release
+        # creates a new pod spec hash → new ReplicaSet → accumulated stale ReplicaSets.
+        # Track version via image tag or deployment metadata instead.
+
+      annotations:
+        # ── Vault Agent Injector ───────────────────────────────────────────
+        # These annotations instruct the Vault mutating webhook to:
+        #   1. Add an init container that authenticates with Vault and fetches secrets
+        #   2. Inject the vault-secrets volume (tmpfs emptyDir) automatically
+        #   3. Mount /vault/secrets into every container automatically
+        #
+        # FIX [1]: Do NOT declare vault-secrets volume or volumeMount manually.
+        #          The injector owns those — declaring them here causes duplicates.
+        vault.hashicorp.com/agent-inject: "true"
+        vault.hashicorp.com/agent-inject-status: "update"
+        vault.hashicorp.com/role: "app-role"
+        vault.hashicorp.com/service: "http://vault.vault.svc.cluster.local:8200"
+
+        # Fetch app secrets and write to /vault/secrets/app-creds
+        vault.hashicorp.com/agent-inject-secret-app-creds: "secret/data/app"
+        vault.hashicorp.com/agent-inject-template-app-creds: |
+          {{- with secret "secret/data/app" -}}
+          export JWT_SECRET="{{ .Data.data.jwt_secret }}"
+          export SESSION_SECRET="{{ .Data.data.session_secret }}"
+          {{- end }}
+          {{- with secret "secret/data/mysql" -}}
+          export DB_PASSWORD="{{ .Data.data.app_password }}"
+          export DB_USER="appuser"
+          {{- end }}
+
+        # Keep Vault sidecar running for live secret rotation
+        vault.hashicorp.com/agent-run-as-same-user: "true"
+        vault.hashicorp.com/agent-pre-populate-only: "false"
+
+    spec:
+      serviceAccountName: vault-auth-sa
+
+      # ── Pod Spread ─────────────────────────────────────────────────────────
+      # FIX [4]: topologySpreadConstraints added for explicit zone + node spread.
+      # With 3 replicas across 2 nodes, ScheduleAnyway avoids scheduling deadlocks
+      # during surge (4 pods temporarily). Complements podAntiAffinity below.
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: topology.kubernetes.io/zone
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              app: backend
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              app: backend
+
+      # ── Pod Anti-Affinity ──────────────────────────────────────────────────
+      # Prefer spreading pods across different nodes.
+      # "Preferred" (not Required) so scheduling doesn't fail on small clusters.
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                topologyKey: kubernetes.io/hostname
+                labelSelector:
+                  matchLabels:
+                    app: backend
+
+      containers:
+        - name: backend
+          image: asia-south1-docker.pkg.dev/naveen-devops-cicd/prod-repo/backend:1.0.0
+
+          # FIX [2]: IfNotPresent — correct for pinned immutable tags like 1.0.0.
+          # "Always" causes unnecessary registry round-trips on every pod restart.
+          imagePullPolicy: IfNotPresent
+
+          # Source Vault-injected secrets before starting Node.js.
+          # /vault/secrets/app-creds is written by the Vault init container.
+          # The Vault injector mounts this path automatically — do not declare it manually.
+          command:
+            - sh
+            - -c
+            - |
+              [ -f /vault/secrets/app-creds ] && source /vault/secrets/app-creds
+              exec node src/server.js
+
+          ports:
+            - name: http
+              containerPort: 3000
+              protocol: TCP
+
+          # ── Environment Variables (non-sensitive) ──────────────────────────
+          # Sensitive vars (DB_PASSWORD, JWT_SECRET) come from Vault via command above.
+          envFrom:
+            - configMapRef:
+                name: app-config    # NODE_ENV, DB_HOST, DB_PORT, DB_NAME, etc.
+
+          # ── Resource Requests & Limits ────────────────────────────────────
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "128Mi"
+            limits:
+              cpu: "500m"
+              memory: "512Mi"
+
+          # ── Liveness Probe ─────────────────────────────────────────────────
+          # CRITICAL: Must NOT check the database.
+          # DB outage → liveness fails → all pods restart → cascade outage.
+          # /api/ping returns 200 as long as the Node.js process is alive.
+          livenessProbe:
+            httpGet:
+              path: /api/ping
+              port: http
+            initialDelaySeconds: 30    # Node.js + Vault init container takes ~20s
+            periodSeconds: 15
+            timeoutSeconds: 5
+            failureThreshold: 3
+            successThreshold: 1
+
+          # ── Readiness Probe ────────────────────────────────────────────────
+          # Checks DB connectivity — traffic withheld until DB connection is valid.
+          # Correctly handles pod starting before DB is ready without restarting it.
+          readinessProbe:
+            httpGet:
+              path: /api/health
+              port: http
+            initialDelaySeconds: 15
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
+            successThreshold: 1
+
+          # ── Lifecycle Hook ─────────────────────────────────────────────────
+          # preStop sleep ensures kube-proxy removes this pod from endpoint slices
+          # before SIGTERM is sent. Without this, in-flight requests arrive at a
+          # pod that has already started shutting down.
+          lifecycle:
+            preStop:
+              exec:
+                command: ["sh", "-c", "sleep 5"]
+
+          # FIX [1]: volumeMounts block removed entirely.
+          # The Vault injector automatically mounts /vault/secrets into this container.
+          # Declaring it manually causes: "mountPath /vault/secrets must be unique"
+
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: false
+            runAsNonRoot: true
+            runAsUser: 1001       # nodeuser from Dockerfile
+            capabilities:
+              drop: ["ALL"]
+
+      # FIX [1]: volumes block removed entirely.
+      # The Vault injector automatically injects the vault-secrets tmpfs volume.
+      # Declaring it manually causes: "Duplicate value: vault-secrets"
+
+      # 60s grace period > 5s preStop sleep + Node.js graceful shutdown time
+      terminationGracePeriodSeconds: 60

@@ -1,0 +1,96 @@
+# ============================================================
+# nginx-configmap.yaml
+#
+# Nginx configuration for the frontend deployment.
+# Mounted into the container at /etc/nginx/nginx.conf.
+#
+# This ConfigMap MUST be applied before frontend-deployment.yaml.
+# Failing to apply it causes: MountVolume.SetUp failed — configmap "nginx-config" not found
+#
+# Apply order in deploy-k8s.sh:
+#   kubectl apply -f k8s/nginx-configmap.yaml -n "$NAMESPACE"   ← add this
+#   kubectl apply -f k8s/frontend-deployment.yaml -n "$NAMESPACE"
+# ============================================================
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: nginx-config
+  namespace: production
+  labels:
+    app: frontend
+    tier: frontend
+
+data:
+  nginx.conf: |
+    # ── Worker Configuration ───────────────────────────────────────────────
+    worker_processes auto;
+    error_log /var/log/nginx/error.log warn;
+    pid /var/run/nginx.pid;
+
+    events {
+      worker_connections 1024;
+    }
+
+    http {
+      include       /etc/nginx/mime.types;
+      default_type  application/octet-stream;
+
+      # ── Logging ──────────────────────────────────────────────────────────
+      log_format main '$remote_addr - $remote_user [$time_local] "$request" '
+                      '$status $body_bytes_sent "$http_referer" '
+                      '"$http_user_agent" "$http_x_forwarded_for"';
+      access_log /var/log/nginx/access.log main;
+
+      sendfile        on;
+      keepalive_timeout 65;
+
+      # ── Gzip Compression ─────────────────────────────────────────────────
+      gzip on;
+      gzip_types text/plain text/css application/json application/javascript
+                 text/xml application/xml application/xml+rss text/javascript;
+
+      server {
+        listen 80;
+        server_name _;
+
+        root /usr/share/nginx/html;
+        index index.html;
+
+        # ── Health Check Endpoint ───────────────────────────────────────────
+        # Used by liveness and readiness probes in the Deployment.
+        # Returns 200 immediately — no upstream dependency.
+        location /health {
+          access_log off;
+          return 200 "healthy\n";
+          add_header Content-Type text/plain;
+        }
+
+        # ── Static Assets ───────────────────────────────────────────────────
+        # Long cache TTL for hashed asset filenames (JS, CSS bundles).
+        location ~* \.(js|css|png|jpg|jpeg|gif|ico|svg|woff|woff2|ttf|eot)$ {
+          expires 1y;
+          add_header Cache-Control "public, immutable";
+          try_files $uri =404;
+        }
+
+        # ── SPA Fallback ────────────────────────────────────────────────────
+        # All non-asset routes fall through to index.html for client-side routing.
+        location / {
+          try_files $uri $uri/ /index.html;
+        }
+
+        # ── API Proxy ───────────────────────────────────────────────────────
+        # Proxy /api/* requests to the backend service.
+        # Strips the /api prefix before forwarding.
+        location /api/ {
+          proxy_pass         http://backend-service:3000;
+          proxy_http_version 1.1;
+          proxy_set_header   Host              $host;
+          proxy_set_header   X-Real-IP         $remote_addr;
+          proxy_set_header   X-Forwarded-For   $proxy_add_x_forwarded_for;
+          proxy_set_header   X-Forwarded-Proto $scheme;
+          proxy_connect_timeout 5s;
+          proxy_read_timeout    60s;
+        }
+      }
+    }

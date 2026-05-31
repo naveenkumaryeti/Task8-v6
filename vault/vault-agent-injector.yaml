@@ -1,0 +1,50 @@
+# ============================================================
+# vault-agent-injector.yaml
+#
+# Additional configuration for the Vault Agent Injector webhook.
+# The injector itself is installed via Helm (vault-install.yaml).
+# This file configures the MutatingWebhookConfiguration behavior.
+#
+# How it works:
+#   1. Pod is submitted to Kubernetes API
+#   2. API calls this MutatingWebhook before creating the pod
+#   3. Injector examines vault.hashicorp.com/* annotations
+#   4. If present, injects init container (fetches secrets) +
+#      sidecar container (renews token, refreshes secrets)
+#   5. Secrets written to /vault/secrets/ (emptyDir tmpfs)
+#   6. Application container sources the secret file
+# ============================================================
+apiVersion: admissionregistration.k8s.io/v1
+kind: MutatingWebhookConfiguration
+metadata:
+  name: vault-agent-injector-cfg
+  labels:
+    app.kubernetes.io/name: vault-agent-injector
+    app.kubernetes.io/managed-by: Helm
+webhooks:
+  - name: vault.hashicorp.com
+    sideEffects: None
+    admissionReviewVersions: ["v1", "v1beta1"]
+
+    clientConfig:
+      service:
+        name: vault-agent-injector-svc
+        namespace: vault
+        path: "/mutate"
+      # caBundle is populated automatically by Helm
+
+    rules:
+      - operations: ["CREATE", "UPDATE"]
+        apiGroups: [""]
+        apiVersions: ["v1"]
+        resources: ["pods"]
+
+    namespaceSelector:
+      # Only inject into namespaces with this label:
+      # kubectl label namespace production vault-injection=enabled
+      matchLabels:
+        vault-injection: enabled
+
+    failurePolicy: Ignore   # Don't block pod creation if injector is down
+
+    timeoutSeconds: 30

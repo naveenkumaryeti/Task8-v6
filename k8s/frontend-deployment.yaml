@@ -1,0 +1,207 @@
+# ============================================================
+# frontend-deployment.yaml
+#
+# Nginx frontend — serves static assets and proxies /api/* to backend.
+#
+# Key decisions:
+#   - 2 replicas minimum (HA — survives a node failure)
+#   - maxUnavailable: 0 — zero-downtime rolling updates
+#   - ConfigMap-mounted nginx.conf — routing changes don't require image rebuild
+#   - No Vault injection — frontend has no secrets (secrets are backend's concern)
+#   - Readiness probe on /health — Nginx-native, no DB dependency
+#
+# Fixes applied:
+#   [1] nginx-configmap.yaml must be applied before this deployment in deploy-k8s.sh.
+#   [2] checksum/config: replace placeholder with real sha256 in CI/CD pipeline.
+#   [3] imagePullPolicy: IfNotPresent — correct for pinned immutable tags.
+#   [4] kubernetes.io/change-cause annotation used for rollback history.
+#   [5] CRASH FIX: Security context now includes CHOWN, SETUID, SETGID capabilities.
+#       Standard nginx entrypoint chowns /var/cache/nginx to UID 101 before dropping
+#       privileges. Dropping ALL caps without re-adding these causes:
+#         [emerg] chown("/var/cache/nginx/client_temp", 101) failed (1: Operation not permitted)
+#       Alternative: switch to nginxinc/nginx-unprivileged + port 8080 to avoid root entirely.
+#   [6] topologySpreadConstraints: ScheduleAnyway (was DoNotSchedule) — with only 2 replicas
+#       and maxSurge: 1, DoNotSchedule deadlocks rollouts when the surge pod can't satisfy
+#       the spread constraint across 2 nodes. ScheduleAnyway keeps the intent without blocking.
+#   [7] preStop lifecycle hook — drains in-flight requests before SIGTERM.
+#   [8] version label removed from pod template — triggers unnecessary pod churn on each deploy.
+#   [9] GCP_PROJECT_ID placeholder replaced with real project ID: naveen-devops-cicd.
+#
+# DEPLOY SCRIPT REQUIREMENTS (deploy-k8s.sh):
+#   1. export GCP_PROJECT_ID=naveen-devops-cicd   (or set in CI/CD environment)
+#   2. Add guard at top: : "${GCP_PROJECT_ID:?GCP_PROJECT_ID is not set}"
+#   3. Apply nginx ConfigMap before frontend deployment:
+#        kubectl apply -f k8s/nginx-configmap.yaml -n "$NAMESPACE"
+# ============================================================
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: frontend
+  namespace: production
+  labels:
+    app: frontend
+    tier: frontend
+    version: "1.0.0"
+  annotations:
+    kubernetes.io/change-cause: "Initial deployment v1.0.0"
+
+spec:
+  replicas: 2
+
+  selector:
+    matchLabels:
+      app: frontend
+
+  # ── Rolling Update Strategy ──────────────────────────────────────────────
+  # maxUnavailable: 0  → Never reduce capacity during update
+  # maxSurge: 1        → Allow 1 extra pod during rollout (3 pods briefly)
+  # Effect: New pod passes readiness first, then old pod terminates → zero downtime
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 1
+
+  template:
+    metadata:
+      labels:
+        app: frontend
+        tier: frontend
+        # FIX [8]: version removed from pod template — not in selector matchLabels,
+        # but mutating it creates a new pod spec hash on every release causing
+        # unnecessary ReplicaSet proliferation. Track version via image tag instead.
+
+      annotations:
+        # FIX [2]: Compute and inject this in CI/CD to trigger pod restarts on config changes:
+        #   CHECKSUM=$(kubectl get configmap nginx-config -n production -o yaml | sha256sum | cut -d' ' -f1)
+        #   kubectl patch deployment frontend -n production -p "{\"spec\":{\"template\":{\"metadata\":{\"annotations\":{\"checksum/config\":\"$CHECKSUM\"}}}}}"
+        checksum/config: "replace-with-sha256-of-nginx-conf-in-cicd"
+
+    spec:
+      # ── Pod Topology Spread ────────────────────────────────────────────────
+      # FIX [6]: Changed whenUnsatisfiable from DoNotSchedule → ScheduleAnyway.
+      #
+      # Why: With replicas=2 and maxSurge=1, rolling updates temporarily create 3 pods.
+      # DoNotSchedule across 2 nodes with maxSkew=1 means the 3rd pod can never be
+      # scheduled (would create skew=2), deadlocking the rollout permanently.
+      # ScheduleAnyway preserves the spread preference without blocking scheduling.
+      #
+      # Zone spread: survives full AZ outage.
+      # Hostname spread: survives single node failure within a zone.
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: topology.kubernetes.io/zone
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              app: frontend
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              app: frontend
+
+      containers:
+        - name: nginx
+          # FIX [9]: Real project ID — was placeholder "your-gcp-project-id" / "YOUR_PROJECT_ID"
+          image: asia-south1-docker.pkg.dev/naveen-devops-cicd/prod-repo/frontend:1.0.0
+
+          # FIX [3]: IfNotPresent — correct for pinned immutable tags like 1.0.0.
+          # "Always" only makes sense with mutable tags (e.g. "latest") and adds
+          # unnecessary pull latency + registry load on every pod restart.
+          imagePullPolicy: IfNotPresent
+
+          ports:
+            - name: http
+              containerPort: 80
+              protocol: TCP
+
+          # ── Resource Requests & Limits ────────────────────────────────────
+          resources:
+            requests:
+              cpu: "50m"
+              memory: "64Mi"
+            limits:
+              cpu: "200m"
+              memory: "128Mi"
+
+          # ── Lifecycle Hook ─────────────────────────────────────────────────
+          # FIX [7]: preStop gives kube-proxy time to remove this pod from
+          # endpoint slices before nginx stops accepting connections.
+          # Without this, in-flight requests get connection resets during rollouts.
+          # Sleep (5s) must be less than terminationGracePeriodSeconds (30s).
+          lifecycle:
+            preStop:
+              exec:
+                command: ["/bin/sh", "-c", "sleep 5 && nginx -s quit"]
+
+          # ── Liveness Probe ─────────────────────────────────────────────────
+          # Restarts the pod if nginx stops responding. /health is defined in
+          # nginx-configmap.yaml as a simple "return 200" — no upstream dependency.
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 15
+            timeoutSeconds: 5
+            failureThreshold: 3
+            successThreshold: 1
+
+          # ── Readiness Probe ────────────────────────────────────────────────
+          # Pod only receives traffic when this passes.
+          # During rolling update: new pod must pass readiness before old pod terminates.
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 3
+            successThreshold: 1
+
+          volumeMounts:
+            - name: nginx-config
+              mountPath: /etc/nginx/nginx.conf
+              subPath: nginx.conf
+              readOnly: true
+
+          # ── Security Context ───────────────────────────────────────────────
+          # FIX [5]: Root cause of CrashLoopBackOff:
+          #   [emerg] chown("/var/cache/nginx/client_temp", 101) failed (1: Operation not permitted)
+          #
+          # Standard nginx entrypoint runs as root, chowns cache dirs to UID 101
+          # (nginx worker user), then drops to that user. Dropping ALL capabilities
+          # without CHOWN/SETUID/SETGID blocks this and crashes nginx on startup.
+          #
+          # Added: CHOWN  — allows chown of cache dirs to nginx worker UID
+          #        SETUID — allows master process to setuid to worker UID
+          #        SETGID — allows master process to setgid to worker GID
+          #
+          # Long-term recommendation: switch to nginxinc/nginx-unprivileged image
+          # which runs entirely as UID 101 on port 8080 — no root needed at all.
+          # That lets you set runAsNonRoot: true and drop ALL caps with no additions.
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: false  # nginx writes to /var/cache/nginx, /var/run
+            runAsNonRoot: false            # standard nginx master runs as root initially
+            capabilities:
+              drop: ["ALL"]
+              add:
+                - NET_BIND_SERVICE  # bind port 80 as non-root worker
+                - CHOWN             # chown cache dirs to nginx UID 101
+                - SETUID            # drop from root to nginx UID after init
+                - SETGID            # drop from root to nginx GID after init
+
+      volumes:
+        - name: nginx-config
+          configMap:
+            name: nginx-config   # created by k8s/nginx-configmap.yaml — must exist first
+            items:
+              - key: nginx.conf
+                path: nginx.conf
+
+      # Must be > preStop sleep (5s) to give nginx time to drain connections.
+      terminationGracePeriodSeconds: 30

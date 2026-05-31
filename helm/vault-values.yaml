@@ -1,0 +1,55 @@
+global:
+  enabled: true
+  tlsDisable: true
+
+injector:
+  enabled: true
+  replicas: 2
+  logLevel: info
+  resources:
+    requests: { memory: "64Mi",  cpu: "50m"  }
+    limits:   { memory: "128Mi", cpu: "250m" }
+  webhook:
+    failurePolicy: Ignore
+
+server:
+  image:
+    repository: "hashicorp/vault"
+    tag: "1.19.0"
+  resources:
+    requests: { memory: "256Mi", cpu: "250m" }
+    limits:   { memory: "512Mi", cpu: "500m" }
+  standalone:
+    enabled: true
+    config: |
+      ui = true
+      listener "tcp" {
+        tls_disable     = 1
+        address         = "[::]:8200"
+        cluster_address = "[::]:8201"
+      }
+      storage "file" {
+        path = "/vault/data"
+      }
+      disable_mlock = true
+  dataStorage:
+    enabled: true
+    size: 10Gi
+    storageClass: standard-rwo
+    accessMode: ReadWriteOnce
+  readinessProbe:
+    enabled: true
+    path: "/v1/sys/health?standbyok=true&uninitcode=204&sealedcode=204"
+  livenessProbe:
+    enabled: true
+    path: "/v1/sys/health?standbyok=true&uninitcode=204&sealedcode=204"
+    initialDelaySeconds: 120
+    periodSeconds: 10
+    failureThreshold: 6
+
+ui:
+  enabled: true
+  serviceType: ClusterIP
+
+csi:
+  enabled: false

@@ -1,0 +1,72 @@
+# vault/vault-auth.yaml
+# ============================================================
+# ServiceAccount, RBAC, and ConfigMap for Vault Agent injection.
+#
+# CRITICAL RBAC — system:auth-delegator:
+#   Vault's Kubernetes auth method calls the TokenReview API to validate
+#   pod JWTs. This requires the token_reviewer_jwt to have permission to
+#   call that API. system:auth-delegator grants exactly this permission.
+#   Without it, Vault gets 403 from the API server and returns
+#   "permission denied" to every pod trying to authenticate.
+#
+#   We bind vault-auth-sa at CLUSTER scope (not namespace) because
+#   TokenReview is a cluster-scoped API — namespace-scoped bindings
+#   do not grant access to cluster-scoped APIs on GKE.
+# ============================================================
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: vault-auth-sa
+  namespace: production
+  labels:
+    app: vault-auth
+
+---
+# Long-lived token used by Vault as the TokenReview reviewer JWT.
+# Kubernetes 1.24+ no longer auto-creates ServiceAccount token Secrets, so we
+# create one explicitly and read it from vault-secrets.sh. Using this stable
+# reviewer token avoids the 10-minute expiry that caused later Agent logins to
+# fail with "permission denied".
+apiVersion: v1
+kind: Secret
+metadata:
+  name: vault-auth-sa-token
+  namespace: production
+  annotations:
+    kubernetes.io/service-account.name: vault-auth-sa
+  labels:
+    app: vault-auth
+type: kubernetes.io/service-account-token
+
+---
+# system:auth-delegator allows vault-auth-sa to call the TokenReview API.
+# This is what Vault uses to validate pod ServiceAccount JWTs.
+# Must be a ClusterRoleBinding (not RoleBinding) — TokenReview is cluster-scoped.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: vault-token-review-binding
+  labels:
+    app: vault-auth
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: system:auth-delegator
+subjects:
+  - kind: ServiceAccount
+    name: vault-auth-sa
+    namespace: production
+
+---
+# ConfigMap referenced by pods for Vault agent configuration.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: vault-auth-config
+  namespace: production
+  labels:
+    app: vault-auth
+data:
+  vault-addr: "http://vault.vault.svc.cluster.local:8200"
+  vault-role: "app-role"

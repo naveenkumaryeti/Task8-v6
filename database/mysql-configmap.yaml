@@ -1,0 +1,80 @@
+# ============================================================
+# mysql-configmap.yaml
+#
+# Stores non-sensitive MySQL configuration and the init SQL.
+# Sensitive data (passwords) MUST go through Vault — never here.
+#
+# Why ConfigMap for init.sql?
+#   Kubernetes mounts this as a file into /docker-entrypoint-initdb.d/
+#   MySQL executes every .sql file in that directory on first startup.
+# ============================================================
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: mysql-config
+  namespace: production
+  labels:
+    app: mysql
+    tier: database
+    managed-by: kubectl
+data:
+  # ── MySQL Server Configuration ────────────────────────────────────────────
+  MYSQL_DATABASE: "appdb"
+
+  # Performance tuning — adjust based on node memory
+  my.cnf: |
+    [mysqld]
+    # Character set
+    character-set-server  = utf8mb4
+    collation-server      = utf8mb4_unicode_ci
+
+    # InnoDB settings
+    innodb_buffer_pool_size = 256M
+    innodb_log_file_size    = 64M
+    innodb_flush_log_at_trx_commit = 1   # ACID compliance (durability)
+
+    # Connection settings
+    max_connections         = 150
+    connect_timeout         = 10
+    wait_timeout            = 600
+
+    # Logging (useful for debugging slow queries in prod)
+    slow_query_log          = 1
+    slow_query_log_file     = /var/log/mysql/slow.log
+    long_query_time         = 2
+
+    [client]
+    default-character-set = utf8mb4
+
+  # ── Database Initialization Script ────────────────────────────────────────
+  # Mounted to /docker-entrypoint-initdb.d/init.sql in the MySQL container
+  init.sql: |
+    CREATE DATABASE IF NOT EXISTS appdb
+      CHARACTER SET utf8mb4
+      COLLATE utf8mb4_unicode_ci;
+
+    USE appdb;
+
+    CREATE TABLE IF NOT EXISTS users (
+      id         INT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+      name       VARCHAR(255) NOT NULL,
+      email      VARCHAR(255) UNIQUE NOT NULL,
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+      INDEX idx_email (email)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+    CREATE TABLE IF NOT EXISTS events (
+      id         BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+      user_id    INT UNSIGNED,
+      event_type VARCHAR(100) NOT NULL,
+      payload    JSON,
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      INDEX idx_user_id    (user_id),
+      INDEX idx_event_type (event_type),
+      FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE SET NULL
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+    INSERT IGNORE INTO users (name, email) VALUES
+      ('Admin User',  'admin@example.com'),
+      ('Test User',   'test@example.com');
