@@ -1,1083 +1,1053 @@
-# 🚀 Enterprise-Grade Kubernetes Deployment on GKE
+# Enterprise-Grade Kubernetes Deployment on GKE
 
-> Production-grade microservices on Google Kubernetes Engine with GitHub Actions CI/CD,
-> Google Artifact Registry, and HashiCorp Vault secret management.
+> Production-grade three-tier microservices application deployed on Google Kubernetes Engine (GKE)
+> with GitHub Actions CI/CD, Google Artifact Registry, HashiCorp Vault secret management,
+> NGINX Ingress Controller, cert-manager TLS, and full automation scripts.
 
 ---
 
-## 📐 Architecture Overview
+## Table of Contents
+
+1. [Architecture Overview](#architecture-overview)
+2. [Technology Stack](#technology-stack)
+3. [Project Structure](#project-structure)
+4. [File-by-File Description](#file-by-file-description)
+5. [Prerequisites](#prerequisites)
+6. [Environment Variables Reference](#environment-variables-reference)
+7. [GitHub Secrets Reference](#github-secrets-reference)
+8. [Complete Deployment Guide (Step-by-Step)](#complete-deployment-guide-step-by-step)
+   - [Phase 0 — Local Development (Docker Compose)](#phase-0--local-development-docker-compose)
+   - [Phase 1 — GKE Cluster Setup](#phase-1--gke-cluster-setup)
+   - [Phase 2 — Artifact Registry & Docker Images](#phase-2--artifact-registry--docker-images)
+   - [Phase 3 — HashiCorp Vault](#phase-3--hashicorp-vault)
+   - [Phase 4 — Database Deployment](#phase-4--database-deployment)
+   - [Phase 5 — Application Deployment](#phase-5--application-deployment)
+   - [Phase 6 — DNS & TLS Setup](#phase-6--dns--tls-setup)
+   - [Phase 7 — Verify Everything](#phase-7--verify-everything)
+9. [CI/CD Pipeline](#cicd-pipeline)
+10. [Day-2 Operations Scripts](#day-2-operations-scripts)
+11. [Cleanup](#cleanup)
+12. [Troubleshooting](#troubleshooting)
+
+---
+
+## Architecture Overview
 
 ```
 Internet
     │
     ▼
-GCP Load Balancer
+GCP Load Balancer  (external IP)
     │
     ▼
-NGINX Ingress Controller  (TLS termination, rate limiting)
+NGINX Ingress Controller  (TLS termination via cert-manager + Let's Encrypt)
     │
-    ▼
-frontend-service (ClusterIP → Nginx pods × 2)
+    ├── /         → frontend-service  (ClusterIP → Nginx pods × 2)
+    │                   └── Serves static HTML/JS
     │
-    ├── Static assets served directly
-    │
-    └── /api/* → backend-service (ClusterIP → Node.js pods × 3)
+    └── /api/*    → backend-service   (ClusterIP → Node.js pods × 3)
                         │
                         └── mysql-service (ClusterIP → MySQL StatefulSet × 1)
 
-HashiCorp Vault (separate namespace)
-    └── Vault Agent Injector → injects secrets into backend + mysql pods
+HashiCorp Vault  (namespace: vault)
+    └── Vault Agent Injector
+            ├── Injects DB credentials into backend pods
+            └── Injects root password into MySQL pod
+
+GitHub Actions
+    ├── ci.yml  — Build → Test → Trivy Scan → Push to Artifact Registry
+    └── cd.yml  — Pull image → Deploy to GKE → Health check → Rollback on failure
 ```
+
+### Request Flow
+
+1. User hits `https://enterprise-app.duckdns.org`
+2. DNS resolves to GCP Load Balancer external IP
+3. NGINX Ingress terminates TLS (cert from Let's Encrypt via cert-manager)
+4. Static requests (`/`) go to the Nginx frontend pods
+5. API requests (`/api/*`) are proxied to Node.js backend pods
+6. Backend queries MySQL via internal ClusterIP DNS (`mysql-service:3306`)
+7. Secrets (DB password, JWT secret) are never in manifests — Vault Agent injects them as environment variables at pod startup
 
 ---
 
-## 🗂️ Project Structure
+## Technology Stack
+
+| Layer | Technology |
+|---|---|
+| Container Orchestration | Google Kubernetes Engine (GKE) |
+| Cloud Provider | Google Cloud Platform (GCP) — region `asia-south1` |
+| Image Registry | Google Artifact Registry |
+| Secret Management | HashiCorp Vault (Kubernetes auth + Agent Injector) |
+| Frontend | Nginx (static file server + reverse proxy) |
+| Backend | Node.js 20 + Express |
+| Database | MySQL 8.0 (StatefulSet) |
+| Ingress | NGINX Ingress Controller |
+| TLS Certificates | cert-manager + Let's Encrypt (HTTP-01 challenge) |
+| Autoscaling | Horizontal Pod Autoscaler (HPA) |
+| CI/CD | GitHub Actions |
+| Local Dev | Docker Compose |
+
+---
+
+## Project Structure
 
 ```
-project/
-├── frontend/                   # Nginx static frontend
-│   ├── Dockerfile              # Multi-stage: node builder → nginx:alpine
-│   ├── nginx.conf              # Reverse proxy config
-│   ├── package.json
-│   └── src/index.html          # Frontend application
+Task8-v6/
 │
-├── backend/                    # Node.js REST API
-│   ├── Dockerfile              # Multi-stage: deps → production (non-root)
+├── frontend/                        # Nginx static frontend
+│   ├── Dockerfile                   # Multi-stage: Node builder → nginx:alpine
+│   ├── nginx.conf                   # Nginx config: static files + /api proxy
+│   ├── .dockerignore
 │   ├── package.json
-│   ├── jest.config.js
-│   ├── .eslintrc.json
 │   └── src/
-│       ├── server.js           # Express app with graceful shutdown
-│       └── server.test.js      # Jest unit tests
+│       └── index.html               # Frontend HTML/JS application
 │
-├── database/                   # MySQL resources
-│   ├── init.sql                # Schema + seed data
-│   ├── mysql-configmap.yaml    # MySQL config + init script
-│   ├── mysql-deployment.yaml   # StatefulSet with Vault injection
-│   ├── mysql-service.yaml      # ClusterIP (internal only)
-│   └── mysql-pvc.yaml          # 20Gi SSD PVC (standard-rwo)
+├── backend/                         # Node.js REST API
+│   ├── Dockerfile                   # Multi-stage: deps install → production (non-root user)
+│   ├── package.json                 # Express, mysql2, helmet, cors, rate-limit
+│   ├── jest.config.js               # Jest test configuration
+│   ├── .eslintrc.json               # ESLint rules
+│   ├── .dockerignore
+│   └── src/
+│       ├── server.js                # Express app: /api/ping, /api/health, /api/items
+│       └── server.test.js           # Jest unit tests
 │
-├── vault/                      # HashiCorp Vault
-│   ├── vault-install.yaml      # Helm values for Vault
-│   ├── vault-auth.yaml         # Kubernetes auth + ServiceAccount
-│   ├── vault-policy.hcl        # Least-privilege ACL policies
-│   ├── vault-agent-injector.yaml
-│   └── secrets-config.yaml     # Secret path documentation
+├── database/                        # MySQL resources
+│   ├── init.sql                     # Schema creation + seed data
+│   ├── mysql-configmap.yaml         # MySQL config file + init SQL as ConfigMap
+│   ├── mysql-deployment.yaml        # StatefulSet with Vault Agent injection
+│   ├── mysql-service.yaml           # ClusterIP service (internal only)
+│   └── mysql-pvc.yaml               # 20Gi PersistentVolumeClaim (standard-rwo)
 │
-├── k8s/                        # Application Kubernetes manifests
-│   ├── namespace.yaml          # production namespace
-│   ├── configmap.yaml          # Non-sensitive app config
-│   ├── nginx-configmap.yaml    # Nginx config as ConfigMap
-│   ├── frontend-deployment.yaml
-│   ├── frontend-service.yaml   # LoadBalancer (external)
-│   ├── backend-deployment.yaml # 3 replicas, Vault-injected secrets
-│   ├── backend-service.yaml    # ClusterIP (internal)
-│   ├── ingress.yaml            # NGINX Ingress + TLS
-│   └── hpa.yaml               # HPA + PodDisruptionBudgets
+├── vault/                           # HashiCorp Vault configuration
+│   ├── vault-install.yaml           # Helm values for Vault server + injector
+│   ├── vault-auth.yaml              # Kubernetes auth method + ServiceAccount
+│   ├── vault-policy.hcl             # Least-privilege ACL policies
+│   ├── vault-agent-injector.yaml    # Injector webhook configuration
+│   └── secrets-config.yaml          # Secret path documentation
 │
-├── scripts/                    # Automation scripts
-│   ├── cluster-setup.sh        # Create GKE cluster
-│   ├── artifact-registry-setup.sh
-│   ├── docker-auth.sh
-│   ├── build-images.sh
-│   ├── push-images.sh
-│   ├── vault-secrets.sh        # Seed Vault secrets
-│   ├── deploy-database.sh
-│   ├── deploy-vault.sh
-│   ├── deploy-k8s.sh
-│   ├── rolling-update.sh       # Zero-downtime updates + auto-rollback
-│   ├── scale-app.sh
-│   ├── verify-deployment.sh    # Comprehensive health checks
-│   └── cleanup.sh
+├── helm/
+│   └── vault-values.yaml            # Vault Helm chart values (resources, storage)
 │
-├── .github/workflows/
-│   ├── ci.yml                  # Build → Test → Scan → Push
-│   └── cd.yml                  # Deploy to GKE → Verify
+├── k8s/                             # Kubernetes manifests (application layer)
+│   ├── namespace.yaml               # production namespace + Vault injection label
+│   ├── configmap.yaml               # Non-sensitive app config (DB host, CORS, etc.)
+│   ├── nginx-configmap.yaml         # Nginx config mounted into frontend pods
+│   ├── frontend-deployment.yaml     # 2 replicas, liveness/readiness probes, HPA-ready
+│   ├── frontend-service.yaml        # ClusterIP service for frontend
+│   ├── backend-deployment.yaml      # 3 replicas, Vault-injected secrets, Downward API
+│   ├── backend-service.yaml         # ClusterIP service for backend
+│   ├── ingress.yaml                 # NGINX Ingress + TLS + cert-manager annotation
+│   └── hpa.yaml                     # HPA + PodDisruptionBudgets for frontend & backend
 │
-├── docker-compose.yml          # Local dev environment
-├── .gitignore
-└── README.md
+├── cert-manager/
+│   └── cluster-issuer.yaml          # Let's Encrypt ClusterIssuer (prod + staging)
+│
+├── scripts/                         # Automation bash scripts
+│   ├── cluster-setup.sh             # Create GKE cluster (quota-aware)
+│   ├── artifact-registry-setup.sh   # Create GAR repository + cleanup policies
+│   ├── docker-auth.sh               # Authenticate Docker with GAR
+│   ├── build-images.sh              # Build frontend + backend Docker images
+│   ├── push-images.sh               # Tag + push images to GAR
+│   ├── deploy-vault.sh              # Install Vault via Helm + initialize + unseal
+│   ├── vault-secrets.sh             # Configure Vault Kubernetes auth + write secrets
+│   ├── deploy-database.sh           # Deploy MySQL StatefulSet with correct Vault annotations
+│   ├── deploy-k8s.sh                # Deploy frontend + backend + ingress
+│   ├── dns-setup.sh                 # Get LB IP, wait for DNS propagation, apply ingress
+│   ├── dns-validate.sh              # Full DNS + HTTPS + TLS validation checks
+│   ├── verify-deployment.sh         # Comprehensive health check across all components
+│   ├── rolling-update.sh            # Zero-downtime image update + auto-rollback
+│   ├── scale-app.sh                 # Manual scale frontend/backend replicas
+│   └── cleanup.sh                   # Delete resources (safe + full modes)
+│
+├── .github/
+│   └── workflows/
+│       ├── ci.yml                   # CI: Lint → Test → Trivy scan → Push to GAR
+│       └── cd.yml                   # CD: Deploy to GKE → Verify → Rollback on failure
+│
+├── docker-compose.yml               # Local dev: frontend + backend + mysql + vault
+├── vault-init-keys.json             # Auto-generated by deploy-vault.sh (Vault unseal keys)
+├── ca.crt                           # Kubernetes cluster CA certificate
+└── .gitignore
 ```
 
 ---
 
-## ⚡ Quick Start (Full Deployment)
+## File-by-File Description
 
-### Prerequisites
+### Application Files
+
+#### `frontend/src/index.html`
+The complete frontend single-page application. Makes API calls to `/api/health`, `/api/items`, and `/api/ping` to demonstrate the full stack is working.
+
+#### `frontend/nginx.conf`
+Nginx configuration that:
+- Serves static files from `/usr/share/nginx/html`
+- Proxies all `/api/*` requests to the backend service
+- Sets security headers and enables gzip compression
+- This same config is also stored as `k8s/nginx-configmap.yaml` and mounted into pods at runtime (so you can change nginx config without rebuilding the image)
+
+#### `frontend/Dockerfile`
+Two-stage build: Stage 1 uses `node:20-alpine` to install dependencies and process assets. Stage 2 copies results into `nginx:alpine`. Final image is ~25MB.
+
+#### `backend/src/server.js`
+Express API with:
+- `GET /api/ping` — liveness check (never touches DB)
+- `GET /api/health` — readiness check (tests DB connection)
+- `GET /api/items` — fetches data from MySQL
+- `POST /api/items` — inserts data into MySQL
+- Graceful shutdown on SIGTERM (required for zero-downtime rolling updates)
+- All secrets read from environment variables injected by Vault Agent
+
+#### `backend/Dockerfile`
+Two-stage build: Stage 1 installs all dependencies. Stage 2 copies only production dependencies and runs as a non-root user (`node`, UID 1000). This prevents privilege escalation inside the container.
+
+#### `database/init.sql`
+Creates the `appdb` database, `items` table, and inserts sample seed rows. This SQL is run once when MySQL starts for the first time.
+
+#### `docker-compose.yml`
+Local development stack. Starts all four services (frontend, backend, MySQL, Vault in dev mode) on a custom bridge network. Vault runs in dev mode (auto-unsealed, no persistence) for convenience. **Not used in production.**
+
+---
+
+### Kubernetes Manifests (`k8s/`)
+
+#### `k8s/namespace.yaml`
+Creates the `production` namespace with the label `vault-injection: enabled`. This label is required — the Vault Agent Injector webhook filters on it to decide which namespaces to inject into.
+
+#### `k8s/configmap.yaml`
+Stores non-sensitive application configuration as key-value pairs:
+- `DB_HOST`, `DB_PORT`, `DB_NAME` — database connection parameters
+- `ALLOWED_ORIGINS`, `APP_DOMAIN` — CORS configuration
+- `RATE_LIMIT_MAX`, `RATE_LIMIT_WINDOW` — rate limiting
+- **Never store passwords or keys here.** Those come from Vault.
+
+#### `k8s/nginx-configmap.yaml`
+The complete Nginx configuration stored as a ConfigMap and mounted into the frontend pods. This allows you to update Nginx routing rules without rebuilding the Docker image.
+
+#### `k8s/backend-deployment.yaml`
+- 3 replicas for high availability
+- `maxUnavailable: 0` for zero-downtime rolling updates
+- Vault Agent Injector annotations to inject DB credentials
+- Downward API to expose pod name/namespace as environment variables
+- Liveness probe on `/api/ping` (never touches DB)
+- Readiness probe on `/api/health` (validates DB connectivity before receiving traffic)
+
+#### `k8s/frontend-deployment.yaml`
+- 2 replicas
+- Nginx ConfigMap mounted at `/etc/nginx/conf.d/default.conf`
+- Liveness and readiness probes on `/`
+- Resource requests and limits set
+
+#### `k8s/ingress.yaml`
+NGINX Ingress resource that:
+- Routes `/api/*` to `backend-service:3000`
+- Routes `/` to `frontend-service:80`
+- Enforces HTTPS redirect
+- References the TLS secret `app-tls-cert` (created automatically by cert-manager)
+- Annotated with `cert-manager.io/cluster-issuer: letsencrypt-prod` to trigger certificate issuance
+
+#### `k8s/hpa.yaml`
+Horizontal Pod Autoscaler for both frontend and backend:
+- Backend: min 3, max 10 replicas — scales on CPU > 70%
+- Frontend: min 2, max 6 replicas — scales on CPU > 70%
+- Asymmetric stabilization windows (scale-up fast, scale-down slow)
+- PodDisruptionBudgets ensuring at least 1 pod is always available during node drains
+
+---
+
+### Vault Files (`vault/`)
+
+#### `vault/vault-install.yaml` and `helm/vault-values.yaml`
+Helm chart values for installing Vault. Key settings:
+- Standalone mode (single pod) — suitable for learning/dev
+- Vault Agent Injector enabled with 2 replicas for HA
+- `standard-rwo` storage class (GKE-compatible)
+- UI enabled (ClusterIP, access via port-forward)
+
+#### `vault/vault-auth.yaml`
+Configures the Kubernetes authentication method so pods can authenticate to Vault using their ServiceAccount tokens. Also creates the `vault-sa` ServiceAccount used by the application pods.
+
+#### `vault/vault-policy.hcl`
+Least-privilege ACL policy. Grants read-only access to specific secret paths:
+- `secret/data/app` — backend application secrets (DB password, JWT secret)
+- `secret/data/mysql` — MySQL root password
+
+#### `vault/secrets-config.yaml`
+Documentation-as-code file showing what secret paths are used and what keys they contain. Does not contain actual values.
+
+---
+
+### cert-manager Files
+
+#### `cert-manager/cluster-issuer.yaml`
+Defines two `ClusterIssuer` resources:
+- `letsencrypt-prod` — production Let's Encrypt (trusted certificates, rate-limited)
+- `letsencrypt-staging` — staging Let's Encrypt (untrusted but unlimited — use for testing)
+
+When the Ingress is applied, cert-manager reads its annotation, triggers the HTTP-01 ACME challenge, and stores the signed certificate in the Secret `app-tls-cert`.
+
+---
+
+### Scripts (`scripts/`)
+
+| Script | Purpose |
+|---|---|
+| `cluster-setup.sh` | Create GKE cluster with quota-safe disk settings |
+| `artifact-registry-setup.sh` | Create GAR Docker repository |
+| `docker-auth.sh` | Authenticate Docker CLI with GAR |
+| `build-images.sh` | Build frontend + backend images with BuildKit |
+| `push-images.sh` | Tag and push images to GAR |
+| `deploy-vault.sh` | Install Vault via Helm, initialize, unseal, save keys |
+| `vault-secrets.sh` | Configure Vault Kubernetes auth, write app secrets |
+| `deploy-database.sh` | Deploy MySQL StatefulSet with correct Vault annotations |
+| `deploy-k8s.sh` | Deploy all application manifests, verify Vault connectivity |
+| `dns-setup.sh` | Retrieve LB IP, wait for DNS propagation, apply ingress |
+| `dns-validate.sh` | End-to-end DNS, HTTPS, and TLS validation |
+| `verify-deployment.sh` | Full health check: Vault, MySQL, backend, frontend, HPA |
+| `rolling-update.sh` | Zero-downtime image update with auto-rollback on failure |
+| `scale-app.sh` | Manually scale replicas (before HPA kicks in) |
+| `cleanup.sh` | Remove resources safely with confirmation prompt |
+
+---
+
+## Prerequisites
+
+Ensure the following tools are installed and configured on your local machine before starting.
+
+### Required Tools
 
 ```bash
-# Install required tools
-brew install google-cloud-sdk kubectl helm vault  # macOS
-# or follow official docs for Linux
+# 1. Google Cloud SDK (gcloud)
+# Install: https://cloud.google.com/sdk/docs/install
+gcloud version          # Minimum: 450+
 
-# Authenticate
+# 2. kubectl
+gcloud components install kubectl
+kubectl version --client
+
+# 3. Docker (with BuildKit support)
+docker --version        # Minimum: 23+
+
+# 4. Helm
+# Install: https://helm.sh/docs/intro/install/
+helm version            # Minimum: 3.12+
+
+# 5. HashiCorp Vault CLI
+# Install: https://developer.hashicorp.com/vault/install
+vault version
+
+# 6. dig (for DNS validation)
+# Linux:  sudo apt-get install dnsutils
+# macOS:  brew install bind
+
+# 7. curl, jq
+sudo apt-get install curl jq   # or brew install curl jq
+```
+
+### GCP Setup
+
+```bash
+# Authenticate with GCP
 gcloud auth login
+gcloud auth application-default login
+
+# Set your project
 gcloud config set project YOUR_PROJECT_ID
+
+# Enable required APIs
+gcloud services enable \
+  container.googleapis.com \
+  artifactregistry.googleapis.com \
+  secretmanager.googleapis.com \
+  dns.googleapis.com
 ```
 
-### Step-by-Step Deployment
+### Domain Setup
+
+You need a domain with an A record pointing to the GKE Load Balancer IP. This project uses `enterprise-app.duckdns.org` as the example. You can get a free subdomain from [DuckDNS](https://www.duckdns.org) or use any domain you own.
+
+---
+
+## Environment Variables Reference
+
+These environment variables control script behavior. All have sensible defaults — override only what differs in your environment.
+
+| Variable | Default | Description |
+|---|---|---|
+| `GCP_PROJECT_ID` | `naveen-devops-cicd` | Your GCP project ID |
+| `GCP_REGION` | `asia-south1` | GCP region for cluster + registry |
+| `GCP_ZONE` | `asia-south1-a` | GCP zone for cluster |
+| `GKE_CLUSTER_NAME` | `gke-microservices` | Name of the GKE cluster |
+| `GKE_MACHINE_TYPE` | `e2-standard-2` | Node machine type |
+| `GKE_NODE_COUNT` | `2` | Initial number of nodes |
+| `GKE_DISK_SIZE` | `30` | Node boot disk size in GB |
+| `GAR_REPO_NAME` | `prod-repo` | Artifact Registry repository name |
+| `APP_VERSION` | `1.0.0` | Application image version tag |
+| `K8S_NAMESPACE` | `production` | Kubernetes namespace for the app |
+| `VAULT_NAMESPACE` | `vault` | Kubernetes namespace for Vault |
+| `VAULT_LOCAL_PORT` | `8200` | Local port for Vault port-forward |
+
+### Exporting Variables (Recommended)
+
+Create a file `env.sh` (add it to `.gitignore`) and source it before running scripts:
 
 ```bash
-# 1. Create GKE cluster
-bash scripts/cluster-setup.sh
+# env.sh — DO NOT COMMIT THIS FILE
+export GCP_PROJECT_ID="your-actual-project-id"
+export GCP_REGION="asia-south1"
+export GCP_ZONE="asia-south1-a"
+export GAR_REPO_NAME="prod-repo"
+export GKE_CLUSTER_NAME="gke-microservices"
+export APP_VERSION="1.0.0"
+```
 
-# 2. Create Artifact Registry
-bash scripts/artifact-registry-setup.sh
-
-# 3. Authenticate Docker
-bash scripts/docker-auth.sh
-
-# 4. Build Docker images
-bash scripts/build-images.sh 1.0.0
-
-# 5. Push to Artifact Registry
-bash scripts/push-images.sh 1.0.0
-
-# 6. Deploy and configure Vault
-bash scripts/deploy-vault.sh
-# Then unseal manually (see Vault section below)
-
-# 7. Seed secrets into Vault
-VAULT_TOKEN=<root-token> bash scripts/vault-secrets.sh
-
-# 8. Deploy MySQL
-bash scripts/deploy-database.sh
-
-# 9. Deploy application
-bash scripts/deploy-k8s.sh 1.0.0
-
-# 10. Verify everything
-bash scripts/verify-deployment.sh
+```bash
+source env.sh
 ```
 
 ---
 
-## 🔐 Secret Management (HashiCorp Vault)
+## GitHub Secrets Reference
 
-### How it works
+These secrets must be configured in your GitHub repository under **Settings → Secrets and variables → Actions**.
 
-```
-Pod starts
-    │
-    ▼
-Vault Agent Injector (init container)
-    │ reads: /var/run/secrets/kubernetes.io/serviceaccount/token
-    │ authenticates with Vault Kubernetes auth
-    ▼
-Vault returns temporary token
-    │
-    ▼
-Agent fetches secrets from:
-    secret/data/app   → JWT_SECRET, SESSION_SECRET
-    secret/data/mysql → DB_PASSWORD, DB_USER
-    │
-    ▼
-Secrets written to: /vault/secrets/app-creds (tmpfs — never hits disk)
-    │
-    ▼
-Main container sources the file:
-    source /vault/secrets/app-creds
-    exec node src/server.js
-```
+| Secret Name | Description | Example |
+|---|---|---|
+| `GCP_PROJECT_ID` | Your GCP project ID | `my-project-123` |
+| `GCP_SA_KEY` | Base64-encoded service account JSON key | `eyJhbGc...` |
+| `GCP_REGION` | GCP region | `asia-south1` |
+| `GKE_CLUSTER` | GKE cluster name | `gke-microservices` |
+| `GKE_ZONE` | GKE zone | `asia-south1-a` |
+| `GAR_REPO_NAME` | Artifact Registry repo name | `prod-repo` |
 
-### Vault secret paths
-
-| Path | Contents |
-|------|----------|
-| `secret/data/mysql` | root_password, app_password, app_user, host, port, database |
-| `secret/data/app` | jwt_secret, session_secret, api_key |
-| `secret/data/ci` | gke_sa_key (for CI/CD) |
-
-### First-time Vault initialization
+### Creating the Service Account Key
 
 ```bash
-# After deploy-vault.sh completes:
+# Create a service account for CI/CD
+gcloud iam service-accounts create github-actions-sa \
+  --display-name="GitHub Actions CI/CD"
 
-# 1. Get Vault pod name
-VAULT_POD=$(kubectl get pod -n vault -l app.kubernetes.io/name=vault \
-  -o jsonpath='{.items[0].metadata.name}')
+# Grant required roles
+gcloud projects add-iam-policy-binding $GCP_PROJECT_ID \
+  --member="serviceAccount:github-actions-sa@${GCP_PROJECT_ID}.iam.gserviceaccount.com" \
+  --role="roles/artifactregistry.writer"
 
-# 2. Initialize (save the output SECURELY)
-kubectl exec $VAULT_POD -n vault -- vault operator init \
-  -key-shares=5 \
-  -key-threshold=3
+gcloud projects add-iam-policy-binding $GCP_PROJECT_ID \
+  --member="serviceAccount:github-actions-sa@${GCP_PROJECT_ID}.iam.gserviceaccount.com" \
+  --role="roles/container.developer"
 
-# 3. Unseal (run 3 times with 3 different keys from init output)
-kubectl exec $VAULT_POD -n vault -- vault operator unseal <KEY_1>
-kubectl exec $VAULT_POD -n vault -- vault operator unseal <KEY_2>
-kubectl exec $VAULT_POD -n vault -- vault operator unseal <KEY_3>
+# Create and download the JSON key
+gcloud iam service-accounts keys create sa-key.json \
+  --iam-account="github-actions-sa@${GCP_PROJECT_ID}.iam.gserviceaccount.com"
 
-# 4. Seed secrets
-export VAULT_ADDR=http://localhost:8200
-kubectl port-forward svc/vault -n vault 8200:8200 &
-export VAULT_TOKEN=<root-token-from-init>
+# Encode it to base64 for the GitHub secret
+base64 -w 0 sa-key.json
+# Paste the output as the GCP_SA_KEY secret value
+```
+
+---
+
+## Complete Deployment Guide (Step-by-Step)
+
+Follow the phases in order. Each phase depends on the previous one.
+
+---
+
+### Phase 0 — Local Development (Docker Compose)
+
+Use Docker Compose to test the full stack locally before deploying to GKE. This is optional but strongly recommended.
+
+**Step 1: Start all services**
+
+```bash
+# From the project root directory
+docker-compose up -d
+```
+
+This starts:
+- `frontend` — http://localhost:80
+- `backend`  — http://localhost:3000
+- `mysql`    — localhost:3306
+- `vault`    — http://localhost:8200 (dev mode, token = `root`)
+
+**Step 2: Verify services are healthy**
+
+```bash
+# Check all containers are running
+docker-compose ps
+
+# Test backend health endpoint
+curl http://localhost:3000/api/health
+
+# Test via frontend proxy
+curl http://localhost:80/api/ping
+
+# Tail backend logs
+docker-compose logs -f backend
+```
+
+**Step 3: Stop local environment**
+
+```bash
+# Stop without deleting volumes (data preserved)
+docker-compose down
+
+# Stop AND delete volumes (fresh start next time)
+docker-compose down -v
+```
+
+---
+
+### Phase 1 — GKE Cluster Setup
+
+**Step 1: Check your GCP quota (prevents errors)**
+
+```bash
+# Check SSD and disk quota in your region before creating the cluster
+gcloud compute regions describe asia-south1 \
+  --format="table(quotas.metric,quotas.limit,quotas.usage)" \
+  | grep -E "DISK|SSD"
+```
+
+> **Note:** The script uses `pd-balanced` disks (not `pd-ssd`) and 2 nodes × 30 GB to stay within GCP free-tier SSD quotas. If you see `Quota exceeded` errors, reduce `GKE_DISK_SIZE` further.
+
+**Step 2: Create the GKE cluster**
+
+```bash
+bash scripts/cluster-setup.sh
+```
+
+This script:
+1. Runs a pre-flight quota check
+2. Creates a 2-node `e2-standard-2` cluster in `asia-south1-a`
+3. Enables cluster autoscaler (min 2, max 4 nodes)
+4. Configures `kubectl` credentials automatically
+
+**Step 3: Verify cluster is running**
+
+```bash
+kubectl get nodes
+# Expected: 2 nodes in Ready state
+```
+
+**Optional overrides at runtime:**
+
+```bash
+GKE_NODE_COUNT=3 GKE_DISK_SIZE=20 bash scripts/cluster-setup.sh
+```
+
+---
+
+### Phase 2 — Artifact Registry & Docker Images
+
+**Step 1: Create the Artifact Registry repository**
+
+```bash
+bash scripts/artifact-registry-setup.sh
+```
+
+This creates the Docker repository at:
+`asia-south1-docker.pkg.dev/YOUR_PROJECT_ID/prod-repo`
+
+Also configures a cleanup policy: keeps the last 10 image versions and deletes anything older than 30 days.
+
+**Step 2: Authenticate Docker with the registry**
+
+```bash
+bash scripts/docker-auth.sh
+```
+
+Uses `gcloud auth configure-docker` for local development, or a base64-encoded service account key (`GCP_SA_KEY`) for CI environments.
+
+**Step 3: Build the Docker images**
+
+```bash
+# Build version 1.0.0 (default)
+bash scripts/build-images.sh
+
+# Build a specific version
+bash scripts/build-images.sh 1.2.0
+```
+
+Uses BuildKit (`DOCKER_BUILDKIT=1`) for faster parallel builds. Creates two images locally: `frontend:1.0.0` and `backend:1.0.0`.
+
+**Step 4: Push images to Artifact Registry**
+
+```bash
+# Push version 1.0.0 (default)
+bash scripts/push-images.sh
+
+# Push a specific version
+bash scripts/push-images.sh 1.2.0
+```
+
+Tags each image with both `VERSION` and `latest`, then pushes both tags.
+
+---
+
+### Phase 3 — HashiCorp Vault
+
+Vault manages all secrets. It must be deployed and configured before the application.
+
+**Step 1: Install Vault via Helm**
+
+```bash
+bash scripts/deploy-vault.sh
+```
+
+This script:
+1. Adds the HashiCorp Helm repo
+2. Installs Vault using `helm/vault-values.yaml` into the `vault` namespace
+3. Waits for the Vault pod to be running
+4. Initializes Vault (generates 5 unseal keys + root token)
+5. Unseals Vault using 3 of the 5 keys
+6. Saves keys + root token to `vault-init-keys.json` and `/tmp/.vault-env`
+
+> **Important:** The file `vault-init-keys.json` contains your unseal keys and root token. Keep it safe. Do NOT commit it to git (it is in `.gitignore`).
+
+**Step 2: Configure Vault Kubernetes auth and write application secrets**
+
+```bash
 bash scripts/vault-secrets.sh
 ```
 
-> **Production:** Configure [GCP KMS auto-unseal](https://developer.hashicorp.com/vault/docs/configuration/seal/gcpckms) in `vault/vault-install.yaml` — eliminates manual unseal steps.
+This script:
+1. Starts a port-forward to Vault (`localhost:8200`)
+2. Enables the Kubernetes authentication method
+3. Configures it with the cluster's CA certificate (read from inside the Vault pod)
+4. Creates the ACL policies from `vault/vault-policy.hcl`
+5. Creates Vault roles binding ServiceAccounts to policies
+6. Writes secrets at `secret/app` and `secret/mysql`
+
+> **Note:** This script is fully automated. You do not need to run any `vault` CLI commands manually.
+
+**Step 3: Verify Vault is working**
+
+```bash
+# Check Vault pod status
+kubectl get pods -n vault
+
+# Open Vault UI (in a separate terminal)
+kubectl port-forward -n vault svc/vault 8200:8200 &
+# Then open http://localhost:8200 in your browser
+# Use the root token from vault-init-keys.json to log in
+```
 
 ---
 
-## 🔄 CI/CD Pipeline
+### Phase 4 — Database Deployment
+
+**Step 1: Deploy MySQL**
+
+```bash
+bash scripts/deploy-database.sh
+```
+
+This script deploys:
+- PersistentVolumeClaim (`mysql-pvc.yaml`) — 20Gi on `standard-rwo`
+- ConfigMap with MySQL config + init SQL
+- MySQL StatefulSet with the correct `vault.hashicorp.com/service` annotation pointing to `http://vault.vault.svc.cluster.local:8200`
+
+> **Why a dedicated script?** The Vault Agent init container inside the MySQL pod must reach Vault via in-cluster DNS (`vault.vault.svc.cluster.local`), not via localhost. This script generates the manifest with the correct annotation instead of relying on the static `database/mysql-deployment.yaml` file.
+
+**Step 2: Verify MySQL is running**
+
+```bash
+kubectl get pods -n production
+# Expected: mysql-0 is Running (may take 1-2 minutes on first start)
+
+kubectl logs mysql-0 -n production | tail -20
+# Expected: "ready for connections" in the log output
+```
+
+---
+
+### Phase 5 — Application Deployment
+
+**Step 1: Deploy frontend, backend, and ingress**
+
+```bash
+# Deploy version 1.0.0 (default)
+bash scripts/deploy-k8s.sh
+
+# Deploy a specific version
+bash scripts/deploy-k8s.sh 1.2.0
+```
+
+This script:
+1. Verifies Vault is reachable and unsealed
+2. Auto-loads Vault token from `/tmp/.vault-env` if not exported
+3. Verifies secrets exist in Vault (runs `vault-secrets.sh` if not)
+4. Installs cert-manager if not already installed
+5. Applies `cert-manager/cluster-issuer.yaml`
+6. Applies all manifests in `k8s/` (namespace, configmap, deployments, services, ingress, HPA)
+7. Updates image tags to the specified version
+8. Waits for rollouts to complete with diagnostics on failure
+
+**Step 2: Verify pods are running**
+
+```bash
+kubectl get pods -n production
+# Expected output:
+#   frontend-xxxx   2/2   Running   (2 replicas)
+#   backend-xxxx    3/3   Running   (3 replicas, including Vault sidecar)
+#   mysql-0         2/2   Running   (1 pod, including Vault sidecar)
+```
+
+**Step 3: Check services and ingress**
+
+```bash
+kubectl get svc -n production
+kubectl get ingress -n production
+
+# Get the external IP of the NGINX Ingress Controller
+kubectl get svc -n ingress-nginx
+# Copy the EXTERNAL-IP — you will need it for DNS setup
+```
+
+---
+
+### Phase 6 — DNS & TLS Setup
+
+**Step 1: Configure your DNS A record**
+
+Go to your DNS registrar (or DuckDNS dashboard) and create an A record:
+
+```
+Type:  A
+Name:  enterprise-app    (or @  if using the root domain)
+Value: <EXTERNAL-IP from Step 3 above>
+TTL:   300
+```
+
+**Step 2: Wait for DNS propagation and apply ingress**
+
+```bash
+bash scripts/dns-setup.sh
+```
+
+This script:
+1. Retrieves the Load Balancer external IP from the cluster
+2. Prints the exact DNS record you need to add
+3. Polls Google DNS (8.8.8.8 and 8.8.4.4) every 30 seconds until propagation is confirmed (up to 30 minutes)
+4. Once propagated, updates `k8s/ingress.yaml` and `k8s/configmap.yaml` with the correct domain
+5. Applies the updated manifests
+
+> **Note:** DNS propagation typically takes 2–10 minutes for DuckDNS. It can take up to 48 hours for traditional registrars (though usually much faster).
+
+**Step 3: Monitor TLS certificate issuance**
+
+cert-manager automatically requests a certificate from Let's Encrypt once DNS is propagated.
+
+```bash
+# Watch cert-manager logs
+kubectl logs -n cert-manager deployment/cert-manager -f
+
+# Check certificate status
+kubectl get certificate -n production
+# Expected: READY = True (takes 1-3 minutes after DNS is ready)
+
+# Check the Certificate resource details if it's stuck
+kubectl describe certificate app-tls-cert -n production
+```
+
+**Step 4: Test HTTPS access**
+
+```bash
+# Should return 200 and redirect to HTTPS
+curl -L https://enterprise-app.duckdns.org/api/ping
+
+# Open in browser
+echo "https://enterprise-app.duckdns.org"
+```
+
+---
+
+### Phase 7 — Verify Everything
+
+**Full deployment verification:**
+
+```bash
+bash scripts/verify-deployment.sh
+```
+
+This script runs 10 checks:
+1. Vault pod status and seal state
+2. MySQL pod and DB connectivity
+3. Backend deployment and replica count
+4. Frontend deployment and replica count
+5. HPA status for both frontend and backend
+6. Ingress resource status
+7. DNS resolution via Google DNS (8.8.8.8 and 8.8.4.4)
+8. HTTPS endpoint responses (`/api/health`, `/api/ping`)
+9. TLS certificate details (issuer, expiry date)
+10. HTTP → HTTPS redirect verification
+
+**DNS and HTTPS-specific validation:**
+
+```bash
+bash scripts/dns-validate.sh
+
+# Validate a custom domain
+bash scripts/dns-validate.sh --domain your-custom-domain.com
+```
+
+---
+
+## CI/CD Pipeline
+
+The GitHub Actions pipeline has two workflows that run automatically.
 
 ### CI Workflow (`.github/workflows/ci.yml`)
 
+Triggered on:
+- Push to `master` or `develop` branch
+- Pull request to `master`
+- Manual `workflow_dispatch`
+
+**Stages:**
+
 ```
-Push to main/develop
-        │
-        ▼
-  ┌─────────────┐
-  │   Validate   │  npm ci → lint → jest --coverage
-  └──────┬──────┘
-         │
-         ▼
-  ┌─────────────────────┐
-  │  Build Docker Images │  BuildKit multi-stage (cached layers)
-  │  frontend + backend  │
-  └──────────┬──────────┘
-             │
-             ▼
-  ┌──────────────────┐
-  │  Trivy Security  │  HIGH/CRITICAL CVEs → fail build
-  │  Scan both images│  Results → GitHub Security tab
-  └──────┬───────────┘
-         │ (only if scan passes)
-         ▼
-  ┌──────────────────────────────┐
-  │  Push to Artifact Registry   │
-  │  asia-south1-docker.pkg.dev  │
-  └──────────────────────────────┘
+Stage 1: Code Validation
+  ├── ESLint on backend code
+  └── Jest unit tests (backend/src/server.test.js)
+
+Stage 2: Docker Build
+  ├── Build frontend image
+  └── Build backend image
+
+Stage 3: Security Scan (Trivy)
+  ├── Scan frontend image for HIGH/CRITICAL CVEs
+  └── Scan backend image for HIGH/CRITICAL CVEs
+
+Stage 4: Push to Artifact Registry
+  ├── Tag images with git SHA (e.g. sha-abc1234)
+  ├── Tag images with semantic version (if provided)
+  └── Push to asia-south1-docker.pkg.dev/PROJECT/prod-repo
 ```
 
 ### CD Workflow (`.github/workflows/cd.yml`)
 
+Triggered automatically after CI succeeds on `master`. Can also be triggered manually.
+
+**Flow:**
+
 ```
-CI succeeds on main
-        │
-        ▼
-  ┌────────────┐
-  │    Gate    │  Verify CI conclusion == 'success'
-  └─────┬──────┘
-        │
-        ▼
-  ┌─────────────────────────────────┐
-  │  kubectl set image deployment   │  Rolling update (maxUnavailable=0)
-  │  frontend + backend             │
-  └──────────┬──────────────────────┘
-             │
-             ▼
-  ┌──────────────────────┐
-  │  kubectl rollout      │  Wait 180s for complete rollout
-  │  status --timeout     │  Auto-rollback if fails
-  └──────────┬────────────┘
-             │
-             ▼
-  ┌──────────────────────┐
-  │  HTTP health check   │  curl /health → 200 required
-  │  Auto-rollback if ≠  │
-  └──────────────────────┘
+1. Authorize GitHub Actions runner IP in GKE firewall
+2. Authenticate to GKE with service account
+3. Deploy: kubectl set image for frontend + backend
+4. Wait for rollout: kubectl rollout status (5-minute timeout)
+5. Health check: curl /api/health on the live domain
+6. On success: revoke runner IP from firewall
+7. On failure: kubectl rollout undo → restore previous version
 ```
 
-### Required GitHub Secrets
-
-| Secret | Description |
-|--------|-------------|
-| `GCP_PROJECT_ID` | GCP project ID |
-| `GCP_SA_KEY` | Base64-encoded service account JSON |
-| `GCP_REGION` | e.g. `asia-south1` |
-| `GKE_CLUSTER_NAME` | e.g. `prod-cluster` |
-| `GKE_ZONE` | e.g. `asia-south1-a` |
-| `GAR_REPO_NAME` | e.g. `prod-repo` |
-
-```bash
-# Create and encode service account key
-gcloud iam service-accounts create github-actions-sa \
-  --display-name="GitHub Actions CI/CD"
-
-gcloud projects add-iam-policy-binding $PROJECT_ID \
-  --member="serviceAccount:github-actions-sa@${PROJECT_ID}.iam.gserviceaccount.com" \
-  --role="roles/artifactregistry.writer"
-
-gcloud projects add-iam-policy-binding $PROJECT_ID \
-  --member="serviceAccount:github-actions-sa@${PROJECT_ID}.iam.gserviceaccount.com" \
-  --role="roles/container.developer"
-
-gcloud iam service-accounts keys create /tmp/sa-key.json \
-  --iam-account="github-actions-sa@${PROJECT_ID}.iam.gserviceaccount.com"
-
-# Add to GitHub Secrets as GCP_SA_KEY:
-base64 -i /tmp/sa-key.json | pbcopy   # macOS — paste into GitHub Secret
-rm /tmp/sa-key.json
-```
+> **Safety note:** `cancel-in-progress: false` prevents concurrent deploys, which could leave the cluster in a half-deployed state.
 
 ---
 
-## 🔁 Rolling Updates
+## Day-2 Operations Scripts
+
+### Rolling Update (Zero-Downtime)
 
 ```bash
-# Update a specific component
+# Update backend only
 bash scripts/rolling-update.sh backend 1.2.0
+
+# Update frontend only
 bash scripts/rolling-update.sh frontend 1.2.0
+
+# Update both at once
 bash scripts/rolling-update.sh all 1.2.0
-
-# Manual rollback (if needed)
-kubectl rollout undo deployment/backend  -n production
-kubectl rollout undo deployment/frontend -n production
-
-# View rollout history
-kubectl rollout history deployment/backend -n production
 ```
 
----
+The script:
+1. Annotates the deployment with the new version (visible in `kubectl rollout history`)
+2. Updates the container image
+3. Waits for rollout to complete (5-minute timeout)
+4. Automatically runs `kubectl rollout undo` if rollout fails
 
-## 📈 Scaling
+### Manual Scaling
 
 ```bash
-# Manual scaling (HPA overrides this eventually)
+# Scale backend to 5 replicas
 bash scripts/scale-app.sh backend 5
+
+# Scale frontend to 3 replicas
 bash scripts/scale-app.sh frontend 3
 
-# View HPA status
-kubectl get hpa -n production
-
-# HPA scaling rules:
-#   Backend:  min=3, max=10, CPU>70% or Memory>80%
-#   Frontend: min=2, max=6,  CPU>75%
+# Scale both to 5
+bash scripts/scale-app.sh all 5
 ```
 
----
+> **Note:** The HPA will eventually override manual scaling if CPU usage changes. Use this for emergency scale-up during traffic spikes while waiting for HPA to react.
 
-## 🩺 Health Probes
-
-| Component | Liveness Probe | Readiness Probe |
-|-----------|---------------|-----------------|
-| Frontend | `GET /health` (Nginx) | `GET /health` |
-| Backend | `GET /api/ping` (**NO DB check**) | `GET /api/health` (validates DB) |
-| MySQL | `mysqladmin ping` | `mysql -e 'SELECT 1'` |
-
-> **Critical rule:** Liveness probes must NEVER check external dependencies (DB, cache, APIs).
-> If the DB goes down, liveness should NOT restart the pod — that causes cascade restarts.
-> Only readiness should check DB connectivity, which stops traffic without restarting pods.
-
----
-
-## 🐳 Local Development
+### Manual Rollback
 
 ```bash
-# Start everything locally
-docker-compose up -d
-
-# Access points:
-#   Frontend: http://localhost:80
-#   Backend API: http://localhost:3000
-#   Vault UI: http://localhost:8200 (token: dev-root-token)
-#   MySQL: localhost:3306 (user: appuser, pass: devpass123)
-
-# View logs
-docker-compose logs -f backend
-
-# Stop
-docker-compose down        # Keep volumes (data preserved)
-docker-compose down -v     # Remove volumes (data lost)
-```
-
----
-
-## 🔧 Useful kubectl Commands
-
-```bash
-# Pod management
-kubectl get pods -n production -o wide
-kubectl describe pod <pod-name> -n production
-kubectl logs <pod-name> -n production --tail=100 -f
-kubectl exec -it <pod-name> -n production -- sh
-
-# Deployment ops
-kubectl rollout status deployment/backend -n production
-kubectl rollout history deployment/backend -n production
+# Roll back to the previous version
 kubectl rollout undo deployment/backend -n production
+kubectl rollout undo deployment/frontend -n production
 
-# Scaling
-kubectl scale deployment/backend --replicas=5 -n production
+# Roll back to a specific revision
+kubectl rollout history deployment/backend -n production
+kubectl rollout undo deployment/backend --to-revision=2 -n production
+```
 
-# ConfigMap update (triggers pod restart via checksum annotation)
-kubectl edit configmap app-config -n production
-kubectl rollout restart deployment/backend -n production
+### Checking Logs
 
-# Port forwarding (debug without external exposure)
-kubectl port-forward svc/backend-service 3000:3000 -n production
-kubectl port-forward svc/vault 8200:8200 -n vault
+```bash
+# Backend logs (all replicas)
+kubectl logs -l app=backend -n production --tail=100 -f
 
-# Resource usage
-kubectl top pods -n production
-kubectl top nodes
+# Frontend logs
+kubectl logs -l app=frontend -n production --tail=100
+
+# MySQL logs
+kubectl logs mysql-0 -n production --tail=100
+
+# Vault logs
+kubectl logs -n vault -l app.kubernetes.io/name=vault --tail=100
+```
+
+### Accessing the Vault UI
+
+```bash
+# Start port-forward
+kubectl port-forward -n vault svc/vault 8200:8200 &
+
+# Get the root token
+cat vault-init-keys.json | jq -r '.root_token'
+# Or: cat /tmp/.vault-env | grep VAULT_TOKEN
+
+# Open http://localhost:8200 in your browser
 ```
 
 ---
 
-## 🏗️ Key Architecture Decisions
+## Cleanup
 
-| Decision | Choice | Reason |
-|----------|--------|--------|
-| Secret management | HashiCorp Vault | Zero hardcoded secrets anywhere; dynamic injection |
-| MySQL deployment type | StatefulSet | Stable pod name, stable PVC binding |
-| Liveness probe for backend | `/api/ping` (no DB) | Prevents cascade restarts during DB maintenance |
-| `maxUnavailable: 0` | Always 0 | Zero-downtime rolling updates |
-| `preStop: sleep 5` | 5s sleep before SIGTERM | Kubernetes removes pod from endpoints before process stops |
-| Storage class | `standard-rwo` | GKE SSD, ReadWriteOnce — correct for single-writer MySQL |
-| Image registry | Google Artifact Registry | Native GKE integration, IAM-based access, regional |
-| Vault Agent mode | Injector (sidecar) | No app code changes needed; transparent secret delivery |
-
----
-
-## 🧹 Cleanup
+### Remove application resources only (keep PVC data)
 
 ```bash
-# Remove app only (keep namespace + MySQL data)
 bash scripts/cleanup.sh
+# You will be prompted to type 'yes' to confirm
+```
 
-# Remove everything including MySQL data (DESTRUCTIVE)
+### Remove everything including MySQL data (irreversible)
+
+```bash
 bash scripts/cleanup.sh --full
-
-# Delete the entire GKE cluster
-gcloud container clusters delete prod-cluster --zone=asia-south1-a
+# You will be prompted to type 'yes' to confirm
 ```
 
----
-
-## 📋 Environment Variables Reference
-
-### Backend (set via ConfigMap + Vault)
-
-| Variable | Source | Description |
-|----------|--------|-------------|
-| `NODE_ENV` | ConfigMap | `production` |
-| `PORT` | ConfigMap | `3000` |
-| `DB_HOST` | ConfigMap | `mysql-service` |
-| `DB_PORT` | ConfigMap | `3306` |
-| `DB_NAME` | ConfigMap | `appdb` |
-| `DB_USER` | **Vault** | `appuser` |
-| `DB_PASSWORD` | **Vault** | MySQL app user password |
-| `JWT_SECRET` | **Vault** | JWT signing key |
-| `SESSION_SECRET` | **Vault** | Express session secret |
-
----
-
-*Built for production. Tested for zero-downtime. Secured with Vault.*
-
----
-
-## 🌐 Domain Mapping & DNS Configuration
-
-> **Target Domain:** `enterprise-app.gt.tc`
-> **Protocol:** HTTPS (TLS via cert-manager + Let's Encrypt)
-> **Hosting Platform:** GKE + NGINX Ingress Controller + GCP External Load Balancer
-
-This section explains — step by step — how to map the custom domain `enterprise-app.gt.tc` to the running GKE application, configure DNS records, validate propagation using Google Public DNS, and verify the full HTTPS stack.
-
----
-
-### 📐 Domain Mapping Architecture
-
-The request path from a user's browser to your application involves four hops:
-
-```
-User's Browser
-      │
-      │  DNS Lookup: enterprise-app.gt.tc → <GCP Load Balancer IP>
-      ▼
-Google Public DNS (8.8.8.8 / 8.8.4.4)
-      │
-      │  Returns: A Record → e.g. 34.93.120.45
-      ▼
-GCP External Load Balancer  (provisioned automatically by GKE LoadBalancer Service)
-      │
-      │  Port 443 → TLS termination at Ingress Controller
-      │  Port 80  → Redirect to HTTPS (ssl-redirect: "true")
-      ▼
-NGINX Ingress Controller  (running inside GKE cluster, namespace: production)
-      │
-      │  Host-based routing:  enterprise-app.gt.tc → frontend-service
-      ▼
-frontend-service  (ClusterIP, port 80)
-      │
-      ├── Static assets (HTML/CSS/JS)  served by Nginx pods
-      │
-      └── /api/* requests  → backend-service:3000 → Node.js pods
-                                        │
-                                        └── mysql-service:3306 → MySQL StatefulSet
-
-cert-manager (cluster-wide)
-      └── Auto-provisions Let's Encrypt TLS certificate
-          Stores in Kubernetes Secret: app-tls-cert
-          Auto-renews 30 days before expiry
-```
-
----
-
-### Step 1 — Get the External Load Balancer IP
-
-After running `bash scripts/deploy-k8s.sh`, GKE provisions an external IP for the NGINX Ingress Controller. Retrieve it:
+### Remove without confirmation prompt (for CI/CD)
 
 ```bash
-# Wait for the external IP to be assigned (can take 2–5 minutes)
-kubectl get svc ingress-nginx-controller -n ingress-nginx -w
-
-# Expected output (once provisioned):
-# NAME                       TYPE           CLUSTER-IP    EXTERNAL-IP      PORT(S)
-# ingress-nginx-controller   LoadBalancer   10.108.3.45   34.93.120.45     80:31xxx/TCP,443:32xxx/TCP
-
-# Save the EXTERNAL-IP for the DNS step below
-EXTERNAL_IP=$(kubectl get svc ingress-nginx-controller -n ingress-nginx \
-  -o jsonpath='{.status.loadBalancer.ingress[0].ip}')
-echo "Your Load Balancer IP: $EXTERNAL_IP"
+bash scripts/cleanup.sh --force
+bash scripts/cleanup.sh --full --force
 ```
 
-> **Note:** If you used the `frontend-service` LoadBalancer directly (without NGINX Ingress):
-> ```bash
-> kubectl get svc frontend-service -n production -o jsonpath='{.status.loadBalancer.ingress[0].ip}'
-> ```
+### Delete the entire GKE cluster
 
----
-
-### Step 2 — Configure DNS Records
-
-Log into your DNS registrar or DNS management panel for the `gt.tc` domain.
-
-#### Option A — A Record (Recommended for Root Domains)
-
-Use this when mapping directly to a static IP address from the GCP Load Balancer:
-
-| Field       | Value                            | Description                          |
-|-------------|----------------------------------|--------------------------------------|
-| **Type**    | `A`                              | Maps hostname → IPv4 address         |
-| **Name**    | `enterprise-app`                 | Subdomain (under `gt.tc`)            |
-| **Value**   | `34.93.120.45`                   | Your GCP Load Balancer External IP   |
-| **TTL**     | `300` (5 minutes)                | Low TTL during initial setup         |
-
-**DNS Zone File Format:**
-```
-enterprise-app.gt.tc.   300   IN   A   34.93.120.45
-```
-
-#### Option B — CNAME Record (For Cloud Platforms with DNS Names)
-
-Use this if your cloud platform provides a DNS name instead of a static IP (common with GCP Global Load Balancers or if using a CDN):
-
-| Field       | Value                                          | Description                          |
-|-------------|------------------------------------------------|--------------------------------------|
-| **Type**    | `CNAME`                                        | Alias pointing to another hostname   |
-| **Name**    | `enterprise-app`                               | Subdomain (under `gt.tc`)            |
-| **Value**   | `your-lb.asia-south1.cloudapp.gcp.com`         | Cloud-provided DNS hostname          |
-| **TTL**     | `300`                                          | Low TTL during initial setup         |
-
-**DNS Zone File Format:**
-```
-enterprise-app.gt.tc.   300   IN   CNAME   your-lb.asia-south1.cloudapp.gcp.com.
-```
-
-> **Which to use?** For this GKE deployment on GCP with a static external IP assigned by the LoadBalancer service, **use an A Record** (Option A). The GCP External Load Balancer provides a stable IPv4 address.
-
-#### Complete DNS Configuration Example
-
-```
-; gt.tc DNS Zone — example configuration
-; Replace 34.93.120.45 with your actual Load Balancer IP
-
-; Subdomain for the enterprise application
-enterprise-app.gt.tc.   300   IN   A      34.93.120.45
-
-; Optional: www variant (redirects handled by NGINX Ingress)
-www.enterprise-app.gt.tc.  300  IN  CNAME  enterprise-app.gt.tc.
-
-; Optional: CAA record to restrict which CAs can issue TLS certs
-enterprise-app.gt.tc.   300   IN   CAA    0 issue "letsencrypt.org"
+```bash
+gcloud container clusters delete gke-microservices \
+  --zone=asia-south1-a \
+  --quiet
 ```
 
 ---
 
-### Step 3 — Update the Kubernetes Ingress Manifest
+## Troubleshooting
 
-The `k8s/ingress.yaml` uses placeholder hostnames. Update them to reflect the real domain before applying:
-
-```yaml
-# k8s/ingress.yaml — update the tls and rules sections
-
-spec:
-  tls:
-    - hosts:
-        - enterprise-app.gt.tc          # ← Replace yourdomain.com
-      secretName: app-tls-cert          # cert-manager creates this automatically
-
-  rules:
-    - host: enterprise-app.gt.tc        # ← Replace yourdomain.com
-      http:
-        paths:
-          - path: /
-            pathType: Prefix
-            backend:
-              service:
-                name: frontend-service
-                port:
-                  name: http
-```
-
-Apply the updated Ingress:
+### Pod stuck in `Pending`
 
 ```bash
-kubectl apply -f k8s/ingress.yaml -n production
+# Check why the pod cannot be scheduled
+kubectl describe pod <pod-name> -n production
 
-# Verify the Ingress picked up the hostname
-kubectl get ingress app-ingress -n production -o wide
-# Expected:
-# NAME          CLASS   HOSTS                    ADDRESS         PORTS     AGE
-# app-ingress   nginx   enterprise-app.gt.tc     34.93.120.45   80, 443   5m
+# Common causes:
+#   - Insufficient CPU/memory: check node capacity
+#     kubectl describe nodes | grep -A5 "Allocated resources"
+#   - PVC not bound: check storage class
+#     kubectl get pvc -n production
 ```
 
-Also update `k8s/configmap.yaml` to whitelist the real domain for CORS:
-
-```yaml
-# k8s/configmap.yaml — update ALLOWED_ORIGINS
-data:
-  ALLOWED_ORIGINS: "https://enterprise-app.gt.tc"
-```
+### Pod stuck in `Init:0/1` (Vault Agent init container)
 
 ```bash
-kubectl apply -f k8s/configmap.yaml -n production
-# Restart backend to pick up new env var
-kubectl rollout restart deployment/backend -n production
+# Check init container logs
+kubectl logs <pod-name> -n production -c vault-agent-init
+
+# Root cause: Vault Agent cannot reach Vault
+# Fix: Ensure the pod annotation vault.hashicorp.com/service is set to:
+#      http://vault.vault.svc.cluster.local:8200
+# Run deploy-database.sh or deploy-k8s.sh which sets this correctly
 ```
 
----
-
-### Step 4 — Install cert-manager (TLS Certificate Automation)
-
-cert-manager automatically provisions and renews Let's Encrypt TLS certificates so your domain is served over HTTPS without manual intervention.
-
-#### 4a. Install cert-manager
+### `CrashLoopBackOff` on backend
 
 ```bash
-# Install cert-manager CRDs and controller
-kubectl apply -f https://github.com/cert-manager/cert-manager/releases/download/v1.14.0/cert-manager.yaml
+# Check backend container logs
+kubectl logs <backend-pod-name> -n production
 
-# Verify cert-manager pods are running (takes ~60 seconds)
-kubectl get pods -n cert-manager
-# Expected:
-# NAME                                      READY   STATUS    RESTARTS
-# cert-manager-xxxx                         1/1     Running   0
-# cert-manager-cainjector-xxxx              1/1     Running   0
-# cert-manager-webhook-xxxx                 1/1     Running   0
+# Common causes:
+#   - DB_PASSWORD not injected (Vault issue)
+#   - MySQL not ready yet (wait and let it retry)
+#   - Missing environment variable
+
+# Check what environment variables the pod actually has
+kubectl exec <backend-pod-name> -n production -- env | grep DB_
 ```
 
-#### 4b. Create a ClusterIssuer for Let's Encrypt
+### cert-manager certificate not issuing
 
 ```bash
-# Create the ClusterIssuer (save this as cert-manager-issuer.yaml)
-cat <<EOF | kubectl apply -f -
-apiVersion: cert-manager.io/v1
-kind: ClusterIssuer
-metadata:
-  name: letsencrypt-prod
-spec:
-  acme:
-    # Let's Encrypt production endpoint
-    server: https://acme-v02.api.letsencrypt.org/directory
-    # Replace with your actual email address for expiry notifications
-    email: your-email@example.com
-    privateKeySecretRef:
-      name: letsencrypt-prod-account-key
-    solvers:
-      - http01:
-          ingress:
-            class: nginx    # Matches kubernetes.io/ingress.class in ingress.yaml
-EOF
-
-# Verify the ClusterIssuer is ready
-kubectl get clusterissuer letsencrypt-prod
-# Expected:
-# NAME               READY   AGE
-# letsencrypt-prod   True    30s
-```
-
-#### 4c. Verify Certificate Issuance
-
-Once the Ingress is applied with the correct domain, cert-manager automatically:
-1. Creates a `Certificate` resource targeting `enterprise-app.gt.tc`
-2. Completes an HTTP-01 ACME challenge via Let's Encrypt
-3. Stores the signed certificate in the Kubernetes Secret `app-tls-cert`
-
-```bash
-# Watch certificate status (may take 1–3 minutes)
-kubectl get certificate -n production -w
-# Expected:
-# NAME           READY   SECRET         AGE
-# app-tls-cert   True    app-tls-cert   2m
-
-# Inspect certificate details
+# Check the Certificate resource
 kubectl describe certificate app-tls-cert -n production
-# Look for: Status: Certificate is up to date and has not expired
 
-# View ACME challenge (if still in progress)
+# Check CertificateRequest
 kubectl get certificaterequest -n production
-kubectl get order -n production
-kubectl get challenge -n production
+
+# Check cert-manager logs
+kubectl logs -n cert-manager deployment/cert-manager -f
+
+# Common causes:
+#   - DNS not propagated yet (run dns-validate.sh to check)
+#   - Let's Encrypt rate limit hit (use letsencrypt-staging issuer for testing)
+```
+
+### GKE cluster creation fails with `Quota exceeded`
+
+```bash
+# Check your current quota
+gcloud compute regions describe asia-south1 \
+  --format="table(quotas.metric,quotas.limit,quotas.usage)" \
+  | grep -E "DISK|SSD|CPU"
+
+# Solutions:
+#   - Request quota increase in GCP console
+#   - Reduce GKE_DISK_SIZE (e.g. GKE_DISK_SIZE=20 bash scripts/cluster-setup.sh)
+#   - Delete unused disks: gcloud compute disks list --filter="zone:asia-south1-a"
+```
+
+### Vault sealed after pod restart
+
+```bash
+# Vault loses its in-memory master key on restart and needs re-unsealing
+# Use the keys from vault-init-keys.json
+
+export VAULT_ADDR=http://127.0.0.1:8200
+kubectl port-forward -n vault svc/vault 8200:8200 &
+
+# Unseal with 3 of the 5 keys
+vault operator unseal $(cat vault-init-keys.json | jq -r '.unseal_keys_b64[0]')
+vault operator unseal $(cat vault-init-keys.json | jq -r '.unseal_keys_b64[1]')
+vault operator unseal $(cat vault-init-keys.json | jq -r '.unseal_keys_b64[2]')
 ```
 
 ---
 
-### Step 5 — DNS Propagation & Validation
-
-DNS changes do not take effect instantly. Propagation can take anywhere from a few seconds (with low TTL like 300s) to 48 hours (with high TTL or slow resolvers). Google Public DNS (`8.8.8.8` / `8.8.4.4`) typically reflects changes within minutes.
-
-#### What is DNS Propagation?
-
-When you update an A Record in your DNS registrar, the change must spread from your registrar's authoritative name servers to DNS resolvers worldwide (recursive resolvers like `8.8.8.8`). During propagation, some users may resolve the old IP while others get the new one — this is normal and temporary.
-
-#### 5a. Validate from Linux/macOS
-
-```bash
-# ── Using nslookup ──────────────────────────────────────────────────────────
-
-# Query Google's primary DNS server
-nslookup enterprise-app.gt.tc 8.8.8.8
-# Expected output:
-# Server:     8.8.8.8
-# Address:    8.8.8.8#53
-#
-# Non-authoritative answer:
-# Name:    enterprise-app.gt.tc
-# Address: 34.93.120.45      ← Must match your Load Balancer IP
-
-# Query Google's secondary DNS server
-nslookup enterprise-app.gt.tc 8.8.4.4
-# Expected output: same IP address as above
-
-# ── Using dig (more detailed output) ──────────────────────────────────────
-
-# Primary DNS
-dig @8.8.8.8 enterprise-app.gt.tc
-# Look for the ANSWER SECTION:
-# enterprise-app.gt.tc.  300  IN  A  34.93.120.45
-
-# Secondary DNS
-dig @8.8.4.4 enterprise-app.gt.tc
-# Same IP expected
-
-# Short output format (just the IP)
-dig @8.8.8.8 enterprise-app.gt.tc +short
-# Expected: 34.93.120.45
-
-# Check TTL remaining
-dig @8.8.8.8 enterprise-app.gt.tc +ttlid
-```
-
-#### 5b. Validate from Windows
-
-```powershell
-# Query Google's primary DNS server
-nslookup enterprise-app.gt.tc 8.8.8.8
-# Expected:
-# Server:  dns.google
-# Address: 8.8.8.8
-#
-# Non-authoritative answer:
-# Name:    enterprise-app.gt.tc
-# Address: 34.93.120.45
-
-# Query Google's secondary DNS server
-nslookup enterprise-app.gt.tc 8.8.4.4
-# Expected: same IP address
-
-# PowerShell alternative
-Resolve-DnsName -Name enterprise-app.gt.tc -Server 8.8.8.8
-# Expected output:
-# Name                           Type  TTL   Section   IPAddress
-# enterprise-app.gt.tc           A     300   Answer    34.93.120.45
-```
-
-#### 5c. Cross-Region Propagation Check
-
-DNS propagation varies by region. Use online tools to verify global reach:
-
-```bash
-# Use dig with a trace to follow the full delegation chain
-dig @8.8.8.8 enterprise-app.gt.tc +trace
-
-# Check from authoritative nameserver directly (skip cache)
-# First, find the authoritative NS for gt.tc
-dig @8.8.8.8 gt.tc NS +short
-# Then query the authoritative server directly
-dig @<authoritative-ns-from-above> enterprise-app.gt.tc A
-```
-
----
-
-### Step 6 — Verify Application Accessibility
-
-#### 6a. HTTPS Access
-
-Once DNS has propagated and the TLS certificate is issued:
-
-```bash
-# Full HTTPS verification
-curl -v https://enterprise-app.gt.tc
-# Expected:
-#   * SSL certificate verify ok
-#   * subject: CN=enterprise-app.gt.tc
-#   * issuer: C=US, O=Let's Encrypt, CN=R3
-#   < HTTP/2 200
-
-# Test health endpoint
-curl -s https://enterprise-app.gt.tc/health
-# Expected: {"status":"healthy","service":"frontend"}
-
-# Test API endpoint
-curl -s https://enterprise-app.gt.tc/api/ping
-# Expected: {"status":"ok"}  or similar ping response
-
-curl -s https://enterprise-app.gt.tc/api/health
-# Expected: {"status":"ok","db":"connected"}  (readiness probe endpoint)
-```
-
-#### 6b. HTTP → HTTPS Redirect Verification
-
-The Ingress forces HTTPS (`ssl-redirect: "true"`). Confirm the redirect works:
-
-```bash
-curl -Lv http://enterprise-app.gt.tc
-# Expected: HTTP 301 → https://enterprise-app.gt.tc → HTTP 200
-# Look for:  < HTTP/1.1 301 Moved Permanently
-#            < Location: https://enterprise-app.gt.tc/
-```
-
-#### 6c. SSL/TLS Certificate Verification
-
-```bash
-# Inspect the certificate details
-echo | openssl s_client -connect enterprise-app.gt.tc:443 -servername enterprise-app.gt.tc 2>/dev/null \
-  | openssl x509 -noout -text | grep -E "Subject|Issuer|Not (Before|After)"
-# Expected:
-#   Subject: CN=enterprise-app.gt.tc
-#   Issuer:  C=US, O=Let's Encrypt, CN=R3
-#   Not Before: [date of issuance]
-#   Not After:  [date ~90 days later]
-
-# Check cert expiry date
-echo | openssl s_client -connect enterprise-app.gt.tc:443 2>/dev/null \
-  | openssl x509 -noout -enddate
-# Expected:
-#   notAfter=Aug 28 12:00:00 2026 GMT
-```
-
-#### 6d. Full Stack Verification Script
-
-The existing `scripts/verify-deployment.sh` already checks pod health and internal IP. Add this domain verification block at the end:
-
-```bash
-# Append to scripts/verify-deployment.sh or run standalone:
-
-DOMAIN="enterprise-app.gt.tc"
-
-echo "── Domain Resolution Check ──"
-RESOLVED_IP=$(dig @8.8.8.8 "$DOMAIN" +short | head -1)
-echo "Resolved IP from Google DNS: $RESOLVED_IP"
-
-echo "── HTTPS Health Check ──"
-HTTP_STATUS=$(curl -s -o /dev/null -w "%{http_code}" "https://$DOMAIN/health")
-echo "HTTPS /health status: $HTTP_STATUS"
-[ "$HTTP_STATUS" = "200" ] && echo "✓ Application is reachable" || echo "✗ Application not reachable"
-
-echo "── TLS Certificate Check ──"
-CERT_EXPIRY=$(echo | openssl s_client -connect "$DOMAIN:443" 2>/dev/null \
-  | openssl x509 -noout -enddate 2>/dev/null)
-echo "Certificate expiry: $CERT_EXPIRY"
-```
-
----
-
-### Step 7 — Expected Outcome
-
-After completing all steps above, the following must hold true:
-
-| Check | Expected Result |
-|-------|----------------|
-| `nslookup enterprise-app.gt.tc 8.8.8.8` | Returns your GCP Load Balancer IP |
-| `nslookup enterprise-app.gt.tc 8.8.4.4` | Returns same IP |
-| `https://enterprise-app.gt.tc` | Returns HTTP 200 with valid content |
-| `http://enterprise-app.gt.tc` | Redirects to HTTPS (HTTP 301) |
-| TLS certificate issuer | Let's Encrypt (via cert-manager) |
-| TLS certificate subject | `CN=enterprise-app.gt.tc` |
-| `https://enterprise-app.gt.tc/health` | `{"status":"healthy","service":"frontend"}` |
-| `https://enterprise-app.gt.tc/api/health` | `{"status":"ok","db":"connected"}` |
-
----
-
-### 🔧 Troubleshooting
-
-#### Problem: DNS not resolving — `nslookup` returns `NXDOMAIN`
-
-**Cause:** DNS record not yet propagated, or A Record is missing/wrong.
-
-```bash
-# Check what the authoritative nameserver returns
-dig @8.8.8.8 enterprise-app.gt.tc
-# If NXDOMAIN: the record doesn't exist yet in the authoritative server
-# If SERVFAIL: check authoritative NS health
-
-# Verify your registrar shows the correct A record
-# Log into your DNS control panel and confirm:
-#   Type: A
-#   Name: enterprise-app
-#   Value: <your Load Balancer IP>
-
-# Force-refresh with no-cache query
-dig @8.8.8.8 enterprise-app.gt.tc +nocache
-```
-
-**Fix:** Re-add the A Record in your DNS panel. If you added it correctly, wait up to 15 minutes and retry.
-
----
-
-#### Problem: DNS resolves but application returns 502 or 503
-
-**Cause:** Ingress controller is up but the backend pods are not ready, or the Ingress rule doesn't match the hostname.
-
-```bash
-# 1. Check Ingress configuration
-kubectl get ingress app-ingress -n production -o yaml
-# Confirm: spec.rules[0].host == "enterprise-app.gt.tc"
-
-# 2. Check backend pod readiness
-kubectl get pods -n production -l app=backend
-# All pods should show READY 1/1
-
-# 3. Check Ingress controller logs
-kubectl logs -n ingress-nginx -l app.kubernetes.io/name=ingress-nginx --tail=50
-# Look for errors related to enterprise-app.gt.tc
-
-# 4. Check events
-kubectl get events -n production --sort-by='.lastTimestamp' | tail -20
-```
-
-**Fix:** Ensure the Ingress `host` field exactly matches the DNS name. Verify backend pods pass their readiness probe (`/api/health`).
-
----
-
-#### Problem: TLS certificate stuck in "Pending" or "False"
-
-**Cause:** cert-manager cannot complete the HTTP-01 ACME challenge because DNS hasn't propagated yet, or port 80 is blocked.
-
-```bash
-# Check certificate status
-kubectl describe certificate app-tls-cert -n production
-# Look for Events section — it shows the ACME challenge progress
-
-# Check challenges
-kubectl get challenges -n production
-kubectl describe challenge -n production
-
-# Most common error:
-# "Waiting for HTTP-01 challenge propagation: failed to perform self-check..."
-# This means Let's Encrypt cannot reach http://enterprise-app.gt.tc/.well-known/acme-challenge/...
-```
-
-**Fix:** Ensure:
-1. DNS has propagated (A Record resolves to correct IP)
-2. Port 80 is open on the GCP firewall (GKE LoadBalancer opens it by default)
-3. The Ingress Controller is running: `kubectl get pods -n ingress-nginx`
-
----
-
-#### Problem: Browser shows "old" cached IP after DNS update
-
-**Cause:** Browser caches DNS responses locally, separate from OS-level DNS cache.
-
-```bash
-# ── Linux (systemd-resolved) ──────────────────────────────────────────────
-sudo systemd-resolve --flush-caches
-# Verify flush:
-sudo systemd-resolve --statistics | grep "Cache"
-
-# ── macOS ─────────────────────────────────────────────────────────────────
-sudo dscacheutil -flushcache && sudo killall -HUP mDNSResponder
-echo "macOS DNS cache flushed"
-
-# ── Windows (PowerShell as Administrator) ─────────────────────────────────
-ipconfig /flushdns
-# Expected: Successfully flushed the DNS Resolver Cache.
-```
-
-**Browser-specific cache clear:**
-- **Chrome:** Navigate to `chrome://net-internals/#dns` → click **Clear host cache**
-- **Firefox:** Press `Ctrl+Shift+Delete` → select **Cache** → clear
-- **Edge:** Navigate to `edge://net-internals/#dns` → click **Clear host cache**
-
----
-
-#### Problem: Firewall blocking traffic — site unreachable even after DNS propagates
-
-**Cause:** GCP VPC firewall rules might block inbound traffic on ports 80/443.
-
-```bash
-# Check GCP firewall rules allow HTTP/HTTPS inbound
-gcloud compute firewall-rules list --filter="network=default" \
-  --format="table(name,direction,allowed,targetTags)"
-
-# If missing, add rules (GKE usually creates these automatically for LoadBalancer services):
-gcloud compute firewall-rules create allow-http-https \
-  --direction=INGRESS \
-  --action=ALLOW \
-  --rules=tcp:80,tcp:443 \
-  --source-ranges=0.0.0.0/0 \
-  --description="Allow HTTP and HTTPS inbound"
-
-# Verify Load Balancer health backend check
-gcloud compute backend-services list --global
-gcloud compute backend-services get-health <backend-service-name> --global
-```
-
----
-
-#### Problem: `curl: (60) SSL certificate problem: certificate has expired`
-
-**Cause:** cert-manager failed to renew the Let's Encrypt certificate (valid for 90 days, auto-renewed at 60 days).
-
-```bash
-# Check cert-manager logs for renewal errors
-kubectl logs -n cert-manager -l app=cert-manager --tail=100 | grep -i "error\|renew\|enterprise-app"
-
-# Force manual renewal
-kubectl delete certificate app-tls-cert -n production
-# cert-manager will automatically re-create and re-issue
-
-# Monitor renewal
-kubectl get certificate -n production -w
-```
-
----
-
-### 📋 DNS Propagation Reference
-
-| DNS Tool | Primary DNS | Secondary DNS | Purpose |
-|----------|-------------|---------------|---------|
-| `nslookup` | `8.8.8.8` | `8.8.4.4` | Quick resolution check |
-| `dig` | `@8.8.8.8` | `@8.8.4.4` | Detailed DNS answer with TTL |
-| `host` | `enterprise-app.gt.tc 8.8.8.8` | — | Simple hostname lookup |
-| `Resolve-DnsName` (Windows) | `-Server 8.8.8.8` | `-Server 8.8.4.4` | PowerShell-native resolution |
-
-**Typical propagation timeline:**
-
-```
-T+0 min   → DNS record added at registrar
-T+1 min   → Authoritative NS returns new record
-T+5 min   → Google DNS (8.8.8.8) reflects new record
-T+15 min  → Most global resolvers have updated
-T+4 hrs   → Full global propagation (worst case for TTL=14400)
-T+48 hrs  → Maximum possible propagation delay (legacy TTLs)
-```
-
-> **Tip:** Set a low TTL (300 seconds) before making DNS changes. After the application is stable, increase TTL to 3600 or 86400 for better caching performance.
-
----
-
-*Domain mapping verified. Application accessible at `https://enterprise-app.gt.tc`.*
+*README generated for Task8-v6 — Enterprise GKE Deployment with Vault, cert-manager, and GitHub Actions CI/CD.*
